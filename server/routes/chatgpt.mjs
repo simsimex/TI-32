@@ -1,46 +1,69 @@
-// chatgpt.mjs — patched for camera + Claude vision support
+// chatgpt.mjs — patched for camera + Claude support (Claude-only ready)
 //
-// Backwards compatible with the original chromalock TI-32 server:
-//   GET  /gpt/ask?question=...     -> text answer (OpenAI gpt-4o)
-//   POST /gpt/solve  (image/jpg)   -> Claude vision answer (was: OpenAI gpt-4o)
-// New routes added by this patch:
-//   POST /gpt/snap   (image/jpg)   -> debug echo of the captured frame size
-//                                     (no API call, no token cost)
+// Routes:
+//   GET  /gpt/ask?question=...     -> text answer
+//   POST /gpt/snap   (image/jpg)   -> debug echo of upload size, no API call
+//   POST /gpt/solve  (image/jpg)   -> vision answer
 //
-// To use Claude: set ANTHROPIC_API_KEY in your .env or environment.
-// To fall back to OpenAI for /solve: set USE_OPENAI_FOR_SOLVE=1 in .env.
+// Defaults to Claude for both /ask and /solve. Only ANTHROPIC_API_KEY is
+// required. OPENAI_API_KEY is optional and only consulted when you set
+// USE_OPENAI=1 (or the route-specific overrides below).
+//
+// Env vars:
+//   ANTHROPIC_API_KEY   required for any Claude call
+//   ANTHROPIC_MODEL     optional, defaults to claude-sonnet-4-5
+//   OPENAI_API_KEY      optional; needed only if you opt into OpenAI
+//   USE_OPENAI          "1" to route BOTH /ask and /solve to OpenAI
+//   USE_OPENAI_FOR_ASK  "1" to route only /ask to OpenAI
+//   USE_OPENAI_FOR_SOLVE  "1" to route only /solve to OpenAI
 
 import express from "express";
-import openai from "openai";
-import Anthropic from "@anthropic-ai/sdk";
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+
+const SYSTEM_PROMPT_ASK =
+  "You are answering a question for someone reading a tiny calculator screen. " +
+  "Be brief. Plain text only — no emojis, no markdown formatting.";
+
 const SYSTEM_PROMPT_SOLVE =
   "You are a math/science tutor answering a question shown in a photo. " +
   "Reply as briefly as possible. If the question is multiple choice, give the letter only. " +
   "Otherwise give just the final answer plus, at most, one short sentence of work. " +
   "Do not use emojis or markdown. The reader is looking at a tiny calculator screen.";
 
+const USE_OPENAI_ASK = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_ASK === "1";
+const USE_OPENAI_SOLVE = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_SOLVE === "1";
+
 export async function chatgpt() {
   const routes = express.Router();
 
-  const gpt = new openai.OpenAI();
+  // Lazily build clients so a missing key for the provider you're NOT using
+  // doesn't crash the whole server at startup.
+  let _openai = null;
+  let _anthropic = null;
 
-  // Lazily build Anthropic client; allow the server to start without the key
-  // so existing /ask calls keep working if the user hasn't set it up yet.
-  let anthropic = null;
-  function getAnthropic() {
-    if (!anthropic) {
-      if (!process.env.ANTHROPIC_API_KEY) {
-        throw new Error("ANTHROPIC_API_KEY is not set");
-      }
-      anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+  async function getOpenAI() {
+    if (_openai) return _openai;
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error("OPENAI_API_KEY is not set");
     }
-    return anthropic;
+    const openai = await import("openai");
+    _openai = new openai.default.OpenAI();
+    return _openai;
+  }
+
+  async function getAnthropic() {
+    if (_anthropic) return _anthropic;
+    if (!process.env.ANTHROPIC_API_KEY) {
+      throw new Error("ANTHROPIC_API_KEY is not set");
+    }
+    const Anthropic = await import("@anthropic-ai/sdk");
+    _anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+    return _anthropic;
   }
 
   // --------------------------------------------------------------------------
-  // GET /gpt/ask  — unchanged from original
+  // GET /gpt/ask — text question, plain answer
   // --------------------------------------------------------------------------
   routes.get("/ask", async (req, res) => {
     const question = req.query.question ?? "";
@@ -48,26 +71,41 @@ export async function chatgpt() {
       res.sendStatus(400);
       return;
     }
-
     try {
-      const result = await gpt.chat.completions.create({
-        messages: [
-          { role: "system", content: "Do not use emojis. " },
-          { role: "user", content: question },
-        ],
-        model: "gpt-4o",
-      });
-      res.send(result.choices[0]?.message?.content ?? "no response");
+      let answer;
+      if (USE_OPENAI_ASK) {
+        const gpt = await getOpenAI();
+        const result = await gpt.chat.completions.create({
+          model: "gpt-4o",
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT_ASK },
+            { role: "user", content: String(question) },
+          ],
+        });
+        answer = result.choices[0]?.message?.content ?? "no response";
+      } else {
+        const client = await getAnthropic();
+        const result = await client.messages.create({
+          model: ANTHROPIC_MODEL,
+          max_tokens: 512,
+          system: SYSTEM_PROMPT_ASK,
+          messages: [{ role: "user", content: String(question) }],
+        });
+        answer = (result.content ?? [])
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("\n")
+          .trim() || "no response";
+      }
+      res.send(answer);
     } catch (e) {
       console.error(e);
-      res.sendStatus(500);
+      res.status(500).send(String(e?.message ?? e));
     }
   });
 
   // --------------------------------------------------------------------------
-  // POST /gpt/snap  — debug endpoint, no API call.
-  // Lets you confirm the calculator -> ESP32 -> server image upload chain
-  // works before you start spending tokens on /solve.
+  // POST /gpt/snap — debug, no API call
   // --------------------------------------------------------------------------
   routes.post("/snap", async (req, res) => {
     const ct = req.headers["content-type"];
@@ -85,7 +123,7 @@ export async function chatgpt() {
   });
 
   // --------------------------------------------------------------------------
-  // POST /gpt/solve  — image -> Claude vision -> short text answer
+  // POST /gpt/solve — image -> vision answer
   // --------------------------------------------------------------------------
   routes.post("/solve", async (req, res) => {
     try {
@@ -108,10 +146,9 @@ export async function chatgpt() {
       const base64Image = Buffer.from(req.body).toString("base64");
       console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length}`);
 
-      // Default path: Claude vision.
-      // Set USE_OPENAI_FOR_SOLVE=1 in .env to fall back to gpt-4o.
       let answer;
-      if (process.env.USE_OPENAI_FOR_SOLVE === "1") {
+      if (USE_OPENAI_SOLVE) {
+        const gpt = await getOpenAI();
         const result = await gpt.chat.completions.create({
           model: "gpt-4o",
           messages: [
@@ -133,7 +170,7 @@ export async function chatgpt() {
         });
         answer = result.choices[0]?.message?.content ?? "no response";
       } else {
-        const client = getAnthropic();
+        const client = await getAnthropic();
         const result = await client.messages.create({
           model: ANTHROPIC_MODEL,
           max_tokens: 512,
@@ -155,7 +192,6 @@ export async function chatgpt() {
             },
           ],
         });
-        // Claude returns content as an array of blocks; concatenate the text ones.
         answer = (result.content ?? [])
           .filter((b) => b.type === "text")
           .map((b) => b.text)
