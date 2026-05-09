@@ -109,18 +109,23 @@ export async function chatgpt() {
   // --------------------------------------------------------------------------
   routes.post("/snap", async (req, res) => {
     const ct = req.headers["content-type"];
+    const bodyLen = req.body?.length ?? 0;
+    const bodyType = Buffer.isBuffer(req.body) ? "Buffer" : typeof req.body;
+    console.log(`/snap hit  ct="${ct}"  bodyType=${bodyType}  bodyLen=${bodyLen}`);
+
     const ctLower = (ct || "").toLowerCase();
     if (!ctLower.startsWith("image/") && ctLower !== "application/octet-stream") {
+      console.log("/snap reject: bad content-type");
       res.status(400).send(`bad content-type: ${ct}`);
       return;
     }
     if (!req.body || !req.body.length) {
+      console.log("/snap reject: empty body");
       res.status(400).send("no image body");
       return;
     }
-    const bytes = req.body.length;
-    console.log(`/snap got ${bytes} bytes`);
-    res.send(`snap ok: ${bytes} bytes`);
+    console.log(`/snap ok ${bodyLen} bytes`);
+    res.send(`snap ok: ${bodyLen} bytes`);
   });
 
   // --------------------------------------------------------------------------
