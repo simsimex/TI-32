@@ -4,10 +4,10 @@
 #define HTTP_USERNAME "" // not used
 #define HTTP_PASSWORD "" // not used
 
-#define WIFI_SSID "" // Your wifi name
-#define WIFI_PASS "" // Your wifi password
-#define SERVER "" // Your server ip address
-#define CHAT_NAME "" // Your name on the chat program
-// #define SECURE // not used
+#define WIFI_SSID "Cloud Guest" // Your wifi name
+#define WIFI_PASS "testtest" // Your wifi password
+#define SERVER "https://ti-32-w-camera.onrender.com" // Your server ip address
+#define CHAT_NAME "sam" // Your name on the chat program
+#define SECURE // not used
 
 #endif // SECRETS_H {CUSTOM}

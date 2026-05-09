@@ -22,9 +22,15 @@ async function main() {
   const app = express();
   app.use(morgan("dev"));
   app.use(cors("*"));
+  // Accept any image/* content-type AND application/octet-stream — different
+  // proxies (and the ESP32) label JPEGs differently. Render's edge proxy may
+  // normalize image/jpg -> image/jpeg in transit.
   app.use(
     bodyParser.raw({
-      type: "image/jpg",
+      type: (req) => {
+        const ct = (req.headers["content-type"] || "").toLowerCase();
+        return ct.startsWith("image/") || ct === "application/octet-stream";
+      },
       limit: "10mb",
     })
   );

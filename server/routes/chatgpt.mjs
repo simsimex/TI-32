@@ -129,7 +129,10 @@ export async function chatgpt() {
     try {
       const ct = req.headers["content-type"];
       console.log("content-type:", ct);
-      if (ct !== "image/jpg") {
+      // Accept image/jpg, image/jpeg, or application/octet-stream — proxies
+      // and clients label JPEGs inconsistently.
+      const ctLower = (ct || "").toLowerCase();
+      if (!ctLower.startsWith("image/") && ctLower !== "application/octet-stream") {
         res.status(400).send(`bad content-type: ${ct}`);
         return;
       }
