@@ -14,7 +14,8 @@
 #include <UrlEncode.h>
 #include <Preferences.h>
 
-// #define CAMERA
+// ---- Camera enabled for XIAO ESP32-S3 Sense ----
+#define CAMERA
 
 #ifdef CAMERA
 #include <esp_camera.h>
@@ -111,7 +112,10 @@ struct Command commands[] = {
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
-constexpr int MAXCOMMAND = 14;
+// Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
+// actually dispatched by loop(). The camera commands snap(7) and solve(8) are
+// already <= 14, but enabling everything keeps the launcher/UI features working.
+constexpr int MAXCOMMAND = 17;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -220,13 +224,14 @@ void setup()
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
-  // this needs to be pixformat grayscale in the future
-  config.pixel_format = PIXFORMAT_JPEG; // for streaming
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  // VGA (640x480) JPEG color: ~25-50 KB per frame, uploads in ~1-2s over WiFi.
+  // Bigger than this exhausts the upload buffer and times out the calculator.
+  config.frame_size = FRAMESIZE_VGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
+  config.jpeg_quality = 12;  // 0=best, 63=worst. 12 is readable for math problems.
+  config.fb_count = 2;       // double-buffered when PSRAM is present
 
   // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
   //                      for larger pre-allocated frame buffer.
@@ -268,8 +273,17 @@ void setup()
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // enable grayscale
-  s->set_special_effect(s, 2);
+  // Color (no special effect). For grayscale uncomment: s->set_special_effect(s, 2);
+  s->set_special_effect(s, 0);
+  // OV2640 ships flipped on the XIAO Sense; flip the image so the lens
+  // poking out the back of the calculator gives an upright photo.
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+  // Auto exposure / white balance ON
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);
 #endif
 
   strncpy(message, "default message", MAXSTRARGLEN);
@@ -668,13 +682,108 @@ void launcher()
   setSuccess("queued transfer");
 }
 
+#ifdef CAMERA
+// Capture a JPEG frame from the OV2640/OV3660 and POST it to a server route.
+// Returns the HTTP status code on success, or a negative errno-style code on
+// transport failure. The server's response body is copied into `result` (up to
+// `resultLen-1` bytes, NUL-terminated) and the byte count goes into `*outLen`.
+//
+// `route` is appended to SERVER, e.g. "/gpt/solve" or "/gpt/snap".
+int captureAndPost(const String &route, char *result, int resultLen, size_t *outLen)
+{
+  memset(result, 0, resultLen);
+  *outLen = 0;
+
+  if (!camera_sign) {
+    Serial.println("captureAndPost: camera not initialized");
+    return -10;
+  }
+
+  // Throw away one frame. The OV sensor's first frame after a long idle is
+  // often stale exposure/AWB; the second one is what the user actually sees.
+  camera_fb_t *warmup = esp_camera_fb_get();
+  if (warmup) esp_camera_fb_return(warmup);
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("captureAndPost: esp_camera_fb_get returned NULL");
+    return -11;
+  }
+  if (fb->format != PIXFORMAT_JPEG) {
+    Serial.println("captureAndPost: frame is not JPEG");
+    esp_camera_fb_return(fb);
+    return -12;
+  }
+  Serial.printf("captured %u bytes (%ux%u)\n", (unsigned)fb->len, fb->width, fb->height);
+
+#ifdef SECURE
+  WiFiClientSecure client;
+  client.setInsecure();
+#else
+  WiFiClient client;
+#endif
+  HTTPClient http;
+  http.setAuthorization(HTTP_USERNAME, HTTP_PASSWORD);
+  http.setTimeout(30000);  // vision calls take a while
+
+  String url = String(SERVER) + route;
+  Serial.println(url);
+  http.begin(client, url.c_str());
+
+  // server/index.mjs is configured for the non-standard "image/jpg" mime —
+  // matching it lets bodyParser.raw populate req.body. Don't change to image/jpeg.
+  http.addHeader("Content-Type", "image/jpg");
+
+  int status = http.POST(fb->buf, fb->len);
+  Serial.print("POST ");
+  Serial.print(url);
+  Serial.print(" -> ");
+  Serial.println(status);
+
+  // Done with the frame buffer regardless of how the POST went.
+  esp_camera_fb_return(fb);
+
+  if (status > 0 && status < 400) {
+    String body = http.getString();
+    size_t copy = min((size_t)(resultLen - 1), (size_t)body.length());
+    memcpy(result, body.c_str(), copy);
+    result[copy] = 0;
+    *outLen = copy;
+  }
+
+  http.end();
+  return status;
+}
+#endif // CAMERA
+
 void snap()
 {
 #ifdef CAMERA
-  if (!camera_sign)
-  {
+  if (!camera_sign) {
     setError("camera failed to initialize");
+    return;
   }
+  // "snap" just confirms the camera works and returns the captured byte count
+  // back to the calculator as a success message. Useful for debugging from
+  // a TI-BASIC applet without burning vision-API tokens.
+  size_t outLen = 0;
+  int status = captureAndPost("/gpt/snap", response, MAXHTTPRESPONSELEN, &outLen);
+  if (status < 0) {
+    setError("camera capture failed");
+    return;
+  }
+  if (status == 404) {
+    // server doesn't have /gpt/snap — capture worked though, report locally
+    snprintf(message, MAXSTRARGLEN, "snap ok (no upload)");
+    setSuccess(message);
+    return;
+  }
+  if (status >= 400) {
+    snprintf(message, MAXSTRARGLEN, "snap http %d", status);
+    setError(message);
+    return;
+  }
+  setSuccess(response);
 #else
   setError("pictures not supported");
 #endif
@@ -683,10 +792,34 @@ void snap()
 void solve()
 {
 #ifdef CAMERA
-  if (!camera_sign)
-  {
+  if (!camera_sign) {
     setError("camera failed to initialize");
+    return;
   }
+  // realArgs[0] is an optional question number from the calculator
+  // ("solve question 3"). We pass it as ?n=3 to /gpt/solve.
+  int qNum = (int)realArgs[0];
+  String route = "/gpt/solve";
+  if (qNum > 0) {
+    route += "?n=" + String(qNum);
+  }
+
+  size_t outLen = 0;
+  int status = captureAndPost(route, response, MAXHTTPRESPONSELEN, &outLen);
+  if (status < 0) {
+    setError("camera capture failed");
+    return;
+  }
+  if (status >= 400) {
+    snprintf(message, MAXSTRARGLEN, "solve http %d", status);
+    setError(message);
+    return;
+  }
+
+  // Reuse the existing pager so long answers can be scrolled on the calculator.
+  fullResponse = String(response);
+  PAGE_PAGE = 0;
+  sendPage();
 #else
   setError("pictures not supported");
 #endif
