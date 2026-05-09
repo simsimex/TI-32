@@ -6,8 +6,10 @@ import dot from "dotenv";
 import { chatgpt } from "./routes/chatgpt.mjs";
 import { images } from "./routes/images.mjs";
 import { chat } from "./routes/chat.mjs";
-import { programs } from "./routes/programs.mjs";
-import { googleApi } from "./routes/googleApi.mjs";
+// programs.mjs imports ../../prepare8xp.mjs which is missing from the repo —
+// disabled until we either restore that file or rewrite the route.
+// import { programs } from "./routes/programs.mjs";
+// import { googleApi } from "./routes/googleApi.mjs";
 dot.config();
 
 async function main() {
@@ -31,8 +33,8 @@ async function main() {
     next();
   });
 
-  // Programs
-  app.use("/programs", programs());
+  // Programs (disabled — see import comment above)
+  // app.use("/programs", programs());
 
   // OpenAI API
   app.use("/gpt", await chatgpt());
