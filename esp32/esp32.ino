@@ -24,8 +24,10 @@
 #include "./camera_index.h"
 #endif
 
-constexpr auto TIP = D1;
-constexpr auto RING = D10;
+// Video-2 wiring (no PCB, hand-soldered): D0 = TIP, D2 = RING.
+// Original chromalock PCB wiring was D1/D10. Change these if you ever rewire.
+constexpr auto TIP = D0;
+constexpr auto RING = D2;
 constexpr auto MAXHDRLEN = 16;
 constexpr auto MAXDATALEN = 4096;
 constexpr auto MAXARGS = 5;
