@@ -732,9 +732,10 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
   Serial.println(url);
   http.begin(client, url.c_str());
 
-  // server/index.mjs is configured for the non-standard "image/jpg" mime —
-  // matching it lets bodyParser.raw populate req.body. Don't change to image/jpeg.
-  http.addHeader("Content-Type", "image/jpg");
+  // Use the standard image/jpeg mime — Render's edge proxy rejects the
+  // non-standard image/jpg before it reaches the Node app. Server-side
+  // bodyParser is now configured to accept any image/* type.
+  http.addHeader("Content-Type", "image/jpeg");
 
   int status = http.POST(fb->buf, fb->len);
   Serial.print("POST ");
