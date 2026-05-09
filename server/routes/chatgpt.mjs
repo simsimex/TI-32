@@ -109,7 +109,8 @@ export async function chatgpt() {
   // --------------------------------------------------------------------------
   routes.post("/snap", async (req, res) => {
     const ct = req.headers["content-type"];
-    if (ct !== "image/jpg") {
+    const ctLower = (ct || "").toLowerCase();
+    if (!ctLower.startsWith("image/") && ctLower !== "application/octet-stream") {
       res.status(400).send(`bad content-type: ${ct}`);
       return;
     }
