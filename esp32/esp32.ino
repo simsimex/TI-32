@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v2.8 ///
+//   TI-32 FIRMWARE v2.9 ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -190,7 +190,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v2.8 /// ===");
+  Serial.println("=== TI-32 v2.9 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -244,14 +244,14 @@ void setup()
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  // VGA (640x480) JPEG color: ~15-25 KB per frame, uploads in ~1-2s over WiFi.
-  // fb_count=1 keeps regular-heap usage low enough for WiFi to also initialize
-  // (each frame buffer reserves DMA descriptors in regular RAM, not PSRAM).
-  config.frame_size = FRAMESIZE_VGA;
+  // SVGA (800x600) JPEG color at quality 8 — readable for handwritten text
+  // and printed problems. Buffer lives in PSRAM so this doesn't crowd WiFi.
+  // ~60-120 KB per frame; uploads in 2-3 sec over a phone hotspot.
+  config.frame_size = FRAMESIZE_SVGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 15;  // 0=best, 63=worst. 15 is readable for math, ~15KB.
+  config.jpeg_quality = 8;   // 0=best, 63=worst. 8 = good detail for text.
   config.fb_count = 1;       // single buffer — DMA fits, leaves room for WiFi
 
   // We keep fb_count=1 even with PSRAM — see comment above. The extra buffer
@@ -291,6 +291,16 @@ void setup()
   s->set_awb_gain(s, 1);
   s->set_exposure_ctrl(s, 1);
   s->set_aec2(s, 1);
+  // Image tuning for paper/text. These nudge the autoexposure toward shorter
+  // shutter times (less motion blur) and crank contrast so faint pencil
+  // strokes show up clearly. Values range -2..+2 unless otherwise noted.
+  s->set_brightness(s, 1);          // slightly brighter
+  s->set_contrast(s, 2);            // max contrast (ink stands out)
+  s->set_saturation(s, 0);          // neutral
+  s->set_sharpness(s, 2);           // crisper edges
+  s->set_denoise(s, 1);             // mild noise reduction
+  s->set_gainceiling(s, GAINCEILING_4X);  // cap auto-gain to avoid grainy frames
+  s->set_aec_value(s, 300);         // bias exposure shorter for less motion blur
 #endif
 
   // WiFi init goes AFTER camera init so the camera gets first crack at
@@ -749,10 +759,15 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
     return -10;
   }
 
-  // Throw away one frame. The OV sensor's first frame after a long idle is
-  // often stale exposure/AWB; the second one is what the user actually sees.
-  camera_fb_t *warmup = esp_camera_fb_get();
-  if (warmup) esp_camera_fb_return(warmup);
+  // Throw away several warmup frames. The OV2640's autoexposure and AWB
+  // converge over the first few frames; using the very first one gives a
+  // dark/over-exposed shot. 4 discarded frames + 200ms delay gives a stable
+  // exposure before we keep the next.
+  for (int i = 0; i < 4; ++i) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup) esp_camera_fb_return(warmup);
+  }
+  delay(200);
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
