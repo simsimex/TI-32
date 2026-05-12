@@ -1,6 +1,12 @@
-// Project: TI-32 v0.1
-// Author:  ChromaLock
-// Date:    2024
+// =============================================================================
+//   TI-32 FIRMWARE v2.8 ///
+//   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
+//   - Wired D0=TIP, D2=RING (video-2 layout)
+//   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
+//   - POSTs JPEG to /gpt/snap and /gpt/solve, image/jpeg content-type
+// =============================================================================
+// Project: TI-32 (chromalock base, modified)
+// Date:    2026
 
 #include "./secrets.h"
 #include "./launcher.h"
@@ -182,8 +188,18 @@ bool camera_sign = false;
 void setup()
 {
   Serial.begin(115200);
-   Serial.println("delay");
-    delay(2000); 
+  Serial.println("delay");
+  delay(2000);
+  Serial.println("=== TI-32 v2.8 /// ===");
+
+  // Explicitly bring up PSRAM. This should already be on via the Tools
+  // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
+  if (psramInit()) {
+    Serial.printf("PSRAM init OK: total %u bytes\n", (unsigned)ESP.getPsramSize());
+  } else {
+    Serial.println("PSRAM init FAILED — camera+HTTPS will not fit in DRAM");
+  }
+
   Serial.println("[CBL]");
   delay(1000);
 
@@ -202,6 +218,8 @@ void setup()
   Serial.println(reboots);
   prefs.putUInt("boots", reboots + 1);
   prefs.end();
+  // (WiFi mode init moved below — must run AFTER esp_camera_init or the
+  // camera fails to allocate its frame buffer.)
 
 #ifdef CAMERA
   Serial.println("[camera]");
@@ -226,40 +244,27 @@ void setup()
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  // VGA (640x480) JPEG color: ~25-50 KB per frame, uploads in ~1-2s over WiFi.
-  // Bigger than this exhausts the upload buffer and times out the calculator.
+  // VGA (640x480) JPEG color: ~15-25 KB per frame, uploads in ~1-2s over WiFi.
+  // fb_count=1 keeps regular-heap usage low enough for WiFi to also initialize
+  // (each frame buffer reserves DMA descriptors in regular RAM, not PSRAM).
   config.frame_size = FRAMESIZE_VGA;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;  // 0=best, 63=worst. 12 is readable for math problems.
-  config.fb_count = 2;       // double-buffered when PSRAM is present
+  config.jpeg_quality = 15;  // 0=best, 63=worst. 15 is readable for math, ~15KB.
+  config.fb_count = 1;       // single buffer — DMA fits, leaves room for WiFi
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
-  if (config.pixel_format == PIXFORMAT_JPEG)
+  // We keep fb_count=1 even with PSRAM — see comment above. The extra buffer
+  // doesn't fit alongside WiFi's heap allocations.
+  if (config.pixel_format == PIXFORMAT_JPEG && !psramFound())
   {
-    if (psramFound())
-    {
-      config.jpeg_quality = 10;
-      config.fb_count = 2;
-      config.grab_mode = CAMERA_GRAB_LATEST;
-    }
-    else
-    {
-      // Limit the frame size when PSRAM is not available
-      config.frame_size = FRAMESIZE_SVGA;
-      config.fb_location = CAMERA_FB_IN_DRAM;
-    }
+    // No PSRAM at all — fall back to smaller frames in regular DRAM.
+    config.frame_size = FRAMESIZE_SVGA;
+    config.fb_location = CAMERA_FB_IN_DRAM;
   }
-  else
-  {
-    // Best option for face detection/recognition
-    config.frame_size = FRAMESIZE_240X240;
-#if CONFIG_IDF_TARGET_ESP32S3
-    config.fb_count = 2;
-#endif
-  }
+  // If we have PSRAM + JPEG, keep the VGA / fb_count=1 / PSRAM settings
+  // configured above. (No else branch — the old chromalock code had one
+  // that forced 240x240 which is useless for our use case.)
 
   // camera init
   esp_err_t err = esp_camera_init(&config);
@@ -287,6 +292,13 @@ void setup()
   s->set_exposure_ctrl(s, 1);
   s->set_aec2(s, 1);
 #endif
+
+  // WiFi init goes AFTER camera init so the camera gets first crack at
+  // PSRAM/heap for its frame buffer.
+  Serial.println("[wifi init]");
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  Serial.println("wifi mode set");
 
   strncpy(message, "default message", MAXSTRARGLEN);
   delay(100);
@@ -577,16 +589,52 @@ void connect()
   Serial.println(ssid);
   Serial.print("PASS: ");
   Serial.println("<hidden>");
-  WiFi.begin(ssid, pass);
+
+  // If we're already on the right network, skip the reconnect — it might
+  // crash, and there's nothing to do anyway.
+  if (WiFi.isConnected() && String(WiFi.SSID()) == String(ssid)) {
+    Serial.println("already on target SSID, skipping reconnect");
+  } else {
+    // Just call WiFi.begin directly. The arduino-esp32 core 3.x WiFi stack
+    // crashes on disconnect()/mode() calls in some states, so don't touch
+    // them — let begin() handle the transition. If the chip was on a
+    // different network with the same name, begin will roam; if on a
+    // different SSID, the timeout below catches it.
+    WiFi.begin(ssid, pass);
+  }
+
+  // Wait up to 15 seconds for a real connection. Don't busy-spin forever.
+  unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
+    if (millis() - start > 15000)
+    {
+      Serial.println("connect timeout");
+      setError("connect timeout");
+      return;
+    }
     if (WiFi.status() == WL_CONNECT_FAILED)
     {
       setError("failed to connect");
       return;
     }
+    delay(200);
+    Serial.print(".");
   }
-  setSuccess("connected");
+
+  // Print what we ACTUALLY ended up associated with — catches the
+  // "silently still on home wifi" case.
+  Serial.println();
+  Serial.print("connected to SSID: ");
+  Serial.println(WiFi.SSID());
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("RSSI: ");
+  Serial.println(WiFi.RSSI());
+
+  // Surface the real SSID to the calculator too, so you can see it on screen.
+  snprintf(message, MAXSTRARGLEN, "connected: %s", WiFi.SSID().c_str());
+  setSuccess(message);
 }
 
 void disconnect()
@@ -717,6 +765,8 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
     return -12;
   }
   Serial.printf("captured %u bytes (%ux%u)\n", (unsigned)fb->len, fb->width, fb->height);
+  Serial.printf("free heap before POST: %u  PSRAM found: %d\n",
+                (unsigned)ESP.getFreeHeap(), (int)psramFound());
 
 #ifdef SECURE
   WiFiClientSecure client;
@@ -771,12 +821,17 @@ void snap()
   // a TI-BASIC applet without burning vision-API tokens.
   size_t outLen = 0;
   int status = captureAndPost("/gpt/snap", response, MAXHTTPRESPONSELEN, &outLen);
-  if (status < 0) {
+  // Distinguish camera errors (-10..-12) from HTTP transport errors (<0)
+  if (status <= -10 && status >= -12) {
     setError("camera capture failed");
     return;
   }
+  if (status < 0) {
+    snprintf(message, MAXSTRARGLEN, "http send err %d (heap?)", status);
+    setError(message);
+    return;
+  }
   if (status == 404) {
-    // server doesn't have /gpt/snap — capture worked though, report locally
     snprintf(message, MAXSTRARGLEN, "snap ok (no upload)");
     setSuccess(message);
     return;

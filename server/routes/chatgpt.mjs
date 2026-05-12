@@ -18,8 +18,22 @@
 //   USE_OPENAI_FOR_SOLVE  "1" to route only /solve to OpenAI
 
 import express from "express";
+import fs from "fs";
+import path from "path";
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+
+// Save the most recent uploaded frame to disk so we can serve it back for
+// debugging. Render's free-tier disk is ephemeral but persists across requests
+// within the same deploy, which is plenty for "what did the camera see?".
+const LAST_SNAP_PATH = path.join(process.cwd(), "last_snap.jpg");
+function saveLastSnap(buf) {
+  try {
+    fs.writeFileSync(LAST_SNAP_PATH, buf);
+  } catch (e) {
+    console.warn("saveLastSnap failed:", e.message);
+  }
+}
 
 const SYSTEM_PROMPT_ASK =
   "You are answering a question for someone reading a tiny calculator screen. " +
@@ -124,8 +138,25 @@ export async function chatgpt() {
       res.status(400).send("no image body");
       return;
     }
-    console.log(`/snap ok ${bodyLen} bytes`);
+    saveLastSnap(req.body);
+    console.log(`/snap ok ${bodyLen} bytes (saved to ${LAST_SNAP_PATH})`);
     res.send(`snap ok: ${bodyLen} bytes`);
+  });
+
+  // --------------------------------------------------------------------------
+  // GET /gpt/last  — serve back the most recent uploaded frame as a JPEG.
+  // Open https://YOUR-RENDER-URL/gpt/last in a browser to see what the
+  // camera last captured. Useful for sanity-checking lens orientation,
+  // focus, and whether the image is what Claude is being asked to read.
+  // --------------------------------------------------------------------------
+  routes.get("/last", (req, res) => {
+    if (!fs.existsSync(LAST_SNAP_PATH)) {
+      res.status(404).send("no snap yet");
+      return;
+    }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(LAST_SNAP_PATH);
   });
 
   // --------------------------------------------------------------------------
@@ -152,8 +183,9 @@ export async function chatgpt() {
         ? `What is the answer to question ${questionNumber}?`
         : "What is the answer to this question?";
 
+      saveLastSnap(req.body);
       const base64Image = Buffer.from(req.body).toString("base64");
-      console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length}`);
+      console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length} (saved)`);
 
       let answer;
       if (USE_OPENAI_SOLVE) {
