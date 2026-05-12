@@ -217,21 +217,8 @@ export async function chatgpt() {
         : "What is the answer to this question?";
 
       saveLastSnap(req.body);
-
-      // Run the enhancement pipeline. If it fails for some reason, fall back
-      // to the original bytes — we'd rather get a rough answer than no answer.
-      let enhancedBuf;
-      try {
-        enhancedBuf = await enhanceForVision(req.body);
-        fs.writeFileSync(LAST_ENHANCED_PATH, enhancedBuf);
-        console.log(`enhanced: ${req.body.length} -> ${enhancedBuf.length} bytes`);
-      } catch (e) {
-        console.warn("enhance failed, using original:", e.message);
-        enhancedBuf = req.body;
-      }
-
-      const base64Image = enhancedBuf.toString("base64");
-      console.log(`/solve got ${req.body.length} bytes, sending enhanced ${enhancedBuf.length} bytes (base64=${base64Image.length})`);
+      const base64Image = Buffer.from(req.body).toString("base64");
+      console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length}`);
 
       let answer;
       if (USE_OPENAI_SOLVE) {

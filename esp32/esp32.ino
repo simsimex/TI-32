@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.1 ///
+//   TI-32 FIRMWARE v3.2 ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -190,7 +190,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.1 /// ===");
+  Serial.println("=== TI-32 v3.2 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -244,16 +244,13 @@ void setup()
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  // UXGA (1600x1200) — the OV2640's native max resolution. Buffer lives in
-  // PSRAM so this doesn't crowd WiFi. JPEG quality 10 keeps file size in a
-  // reasonable range (~150-300 KB), which uploads in ~3-5 sec over a phone
-  // hotspot. Going lower than ~6 risks payload sizes that exhaust the
-  // WiFiClientSecure send buffer.
+  // UXGA (1600x1200) JPEG. Buffer in PSRAM. Quality 8 keeps detail crisp
+  // (a little better than 10) at ~200-350 KB per frame.
   config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 10;
+  config.jpeg_quality = 8;
   config.fb_count = 1;
 
   // We keep fb_count=1 even with PSRAM — see comment above. The extra buffer
@@ -292,19 +289,26 @@ void setup()
   // Auto exposure / white balance ON
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);             // 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
   s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 1);                // enhanced auto exposure algorithm
-  // Image tuning for paper/text in typical indoor light.
-  s->set_brightness(s, 1);          // mild brightness bias (was +2; that
-                                    //   caused blow-outs on white paper)
-  s->set_contrast(s, 1);            // mild contrast bias (was +2)
-  s->set_saturation(s, 0);
-  s->set_sharpness(s, 1);           // +1 (was +2; high sharpness amplifies noise)
+  s->set_aec2(s, 1);
+  // Tuned for paper/text in indoor light, lens focused for ~10in.
+  s->set_brightness(s, 1);
+  s->set_contrast(s, 1);
+  s->set_saturation(s, -1);         // slightly desaturated — color noise is
+                                    //   useless for math text and confuses Claude
+  s->set_sharpness(s, 2);           // crank sharpening back up — lens focus
+                                    //   is now correct so sharpening recovers
+                                    //   real detail instead of amplifying blur
   s->set_denoise(s, 1);
-  s->set_gainceiling(s, GAINCEILING_4X);  // cap gain to control noise
-  s->set_ae_level(s, 2);            // exposure compensation +2 — brighter in
-                                    //   dim rooms, just clamps in bright ones
-  // Don't pin aec_value — let auto-exposure pick the shutter.
+  s->set_gainceiling(s, GAINCEILING_4X);
+  s->set_ae_level(s, 1);            // +1 — modest brightness bias (was +2)
+  s->set_lenc(s, 1);                // lens shading correction — fixes the
+                                    //   darker corners common on small CSI lenses
+  s->set_dcw(s, 1);                 // downsize cropping (improves edge quality
+                                    //   when the sensor scales internally)
+  s->set_bpc(s, 1);                 // bad-pixel correction
+  s->set_wpc(s, 1);                 // white-pixel correction
 #endif
 
   // WiFi init goes AFTER camera init so the camera gets first crack at
