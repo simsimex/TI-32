@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v2.9 ///
+//   TI-32 FIRMWARE v3.1 ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -190,7 +190,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v2.9 /// ===");
+  Serial.println("=== TI-32 v3.1 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -244,15 +244,17 @@ void setup()
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  // SVGA (800x600) JPEG color at quality 8 — readable for handwritten text
-  // and printed problems. Buffer lives in PSRAM so this doesn't crowd WiFi.
-  // ~60-120 KB per frame; uploads in 2-3 sec over a phone hotspot.
-  config.frame_size = FRAMESIZE_SVGA;
+  // UXGA (1600x1200) — the OV2640's native max resolution. Buffer lives in
+  // PSRAM so this doesn't crowd WiFi. JPEG quality 10 keeps file size in a
+  // reasonable range (~150-300 KB), which uploads in ~3-5 sec over a phone
+  // hotspot. Going lower than ~6 risks payload sizes that exhaust the
+  // WiFiClientSecure send buffer.
+  config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 8;   // 0=best, 63=worst. 8 = good detail for text.
-  config.fb_count = 1;       // single buffer — DMA fits, leaves room for WiFi
+  config.jpeg_quality = 10;
+  config.fb_count = 1;
 
   // We keep fb_count=1 even with PSRAM — see comment above. The extra buffer
   // doesn't fit alongside WiFi's heap allocations.
@@ -280,27 +282,29 @@ void setup()
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // Color (no special effect). For grayscale uncomment: s->set_special_effect(s, 2);
+  // Color
   s->set_special_effect(s, 0);
-  // OV2640 ships flipped on the XIAO Sense; flip the image so the lens
-  // poking out the back of the calculator gives an upright photo.
+  // Orientation. With the lens poking out the BACK of the calculator,
+  // pointing away from the user, the image comes back upside-down but not
+  // mirrored. Flip vertically only.
   s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
+  s->set_hmirror(s, 0);             // <-- was 1; that flipped the text
   // Auto exposure / white balance ON
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
   s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 1);
-  // Image tuning for paper/text. These nudge the autoexposure toward shorter
-  // shutter times (less motion blur) and crank contrast so faint pencil
-  // strokes show up clearly. Values range -2..+2 unless otherwise noted.
-  s->set_brightness(s, 1);          // slightly brighter
-  s->set_contrast(s, 2);            // max contrast (ink stands out)
-  s->set_saturation(s, 0);          // neutral
-  s->set_sharpness(s, 2);           // crisper edges
-  s->set_denoise(s, 1);             // mild noise reduction
-  s->set_gainceiling(s, GAINCEILING_4X);  // cap auto-gain to avoid grainy frames
-  s->set_aec_value(s, 300);         // bias exposure shorter for less motion blur
+  s->set_aec2(s, 1);                // enhanced auto exposure algorithm
+  // Image tuning for paper/text in typical indoor light.
+  s->set_brightness(s, 1);          // mild brightness bias (was +2; that
+                                    //   caused blow-outs on white paper)
+  s->set_contrast(s, 1);            // mild contrast bias (was +2)
+  s->set_saturation(s, 0);
+  s->set_sharpness(s, 1);           // +1 (was +2; high sharpness amplifies noise)
+  s->set_denoise(s, 1);
+  s->set_gainceiling(s, GAINCEILING_4X);  // cap gain to control noise
+  s->set_ae_level(s, 2);            // exposure compensation +2 — brighter in
+                                    //   dim rooms, just clamps in bright ones
+  // Don't pin aec_value — let auto-exposure pick the shutter.
 #endif
 
   // WiFi init goes AFTER camera init so the camera gets first crack at

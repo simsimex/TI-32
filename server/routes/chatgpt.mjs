@@ -20,19 +20,41 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import sharp from "sharp";
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 
-// Save the most recent uploaded frame to disk so we can serve it back for
-// debugging. Render's free-tier disk is ephemeral but persists across requests
-// within the same deploy, which is plenty for "what did the camera see?".
+// Save the most recent uploaded frame (original and enhanced) for debugging.
 const LAST_SNAP_PATH = path.join(process.cwd(), "last_snap.jpg");
+const LAST_ENHANCED_PATH = path.join(process.cwd(), "last_enhanced.jpg");
+
 function saveLastSnap(buf) {
   try {
     fs.writeFileSync(LAST_SNAP_PATH, buf);
   } catch (e) {
     console.warn("saveLastSnap failed:", e.message);
   }
+}
+
+// Server-side enhancement pipeline for OV2640 frames before they go to Claude.
+// The OV2640 + tiny aperture + handheld setup produces images that are dark,
+// soft, and grainy in typical indoor light. Sharp can recover a lot of that:
+//   - linear() applies a contrast stretch / brightness boost
+//   - normalise() auto-levels the histogram (rescues underexposed text)
+//   - sharpen() puts edge definition back into soft images
+//   - greyscale() removes color noise, makes text easier for vision models
+//   - median() small denoise pass
+// Returns a Buffer of the enhanced JPEG.
+async function enhanceForVision(inputBuf) {
+  return sharp(inputBuf)
+    .rotate()                          // honor EXIF orientation if any
+    .greyscale()
+    .normalise()                       // auto-levels (this is the big one)
+    .linear(1.15, -8)                  // mild brightness/contrast push
+    .median(1)                         // 1-pixel median = gentle denoise
+    .sharpen({ sigma: 1.2, m1: 0.5, m2: 2.0 }) // unsharp mask, edge-preserving
+    .jpeg({ quality: 90, mozjpeg: true })
+    .toBuffer();
 }
 
 const SYSTEM_PROMPT_ASK =
@@ -159,6 +181,17 @@ export async function chatgpt() {
     res.sendFile(LAST_SNAP_PATH);
   });
 
+  // Same idea, but the post-processed version sent to Claude.
+  routes.get("/last-enhanced", (req, res) => {
+    if (!fs.existsSync(LAST_ENHANCED_PATH)) {
+      res.status(404).send("no enhanced snap yet (run /solve first)");
+      return;
+    }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(LAST_ENHANCED_PATH);
+  });
+
   // --------------------------------------------------------------------------
   // POST /gpt/solve — image -> vision answer
   // --------------------------------------------------------------------------
@@ -184,8 +217,21 @@ export async function chatgpt() {
         : "What is the answer to this question?";
 
       saveLastSnap(req.body);
-      const base64Image = Buffer.from(req.body).toString("base64");
-      console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length} (saved)`);
+
+      // Run the enhancement pipeline. If it fails for some reason, fall back
+      // to the original bytes — we'd rather get a rough answer than no answer.
+      let enhancedBuf;
+      try {
+        enhancedBuf = await enhanceForVision(req.body);
+        fs.writeFileSync(LAST_ENHANCED_PATH, enhancedBuf);
+        console.log(`enhanced: ${req.body.length} -> ${enhancedBuf.length} bytes`);
+      } catch (e) {
+        console.warn("enhance failed, using original:", e.message);
+        enhancedBuf = req.body;
+      }
+
+      const base64Image = enhancedBuf.toString("base64");
+      console.log(`/solve got ${req.body.length} bytes, sending enhanced ${enhancedBuf.length} bytes (base64=${base64Image.length})`);
 
       let answer;
       if (USE_OPENAI_SOLVE) {
