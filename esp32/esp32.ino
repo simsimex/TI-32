@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.2 ///
+//   TI-32 FIRMWARE v3.14-OV5640 (cold-capture + screen fit + launcher) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -9,7 +9,7 @@
 // Date:    2026
 
 #include "./secrets.h"
-#include "./launcher.h"
+#include "./launcher.h"   // CAMERA program blob, pushed by command 5
 #include <TICL.h>
 #include <CBL2.h>
 #include <TIVar.h>
@@ -40,7 +40,7 @@ constexpr auto MAXARGS = 5;
 constexpr auto MAXSTRARGLEN = 256;
 constexpr auto PICSIZE = 756;
 constexpr auto PICVARSIZE = PICSIZE + 2;
-constexpr auto PASSWORD = 69420;
+constexpr auto PASSWORD = 69;
 
 CBL2 cbl;
 Preferences prefs;
@@ -71,7 +71,11 @@ char response[MAXHTTPRESPONSELEN];
 // image variable (96x63)
 uint8_t frame[PICVARSIZE] = {PICSIZE & 0xff, PICSIZE >> 8};
 String fullResponse;
-const int PAGE_SIZE = 100;
+// TI-84 Plus home screen is 96x64 px = 16 chars wide x 8 rows.
+// CAMERA uses rows 1-6 for text and row 8 for the nav hint, so one page is
+// 6 rows x 16 cols = 96 chars. The server word-wraps and pads every line to
+// exactly 16 chars, so slicing at a multiple of 16 lands on a row boundary.
+const int PAGE_SIZE = 96;
 int PAGE_PAGE = 0; 
 
 void connect();
@@ -185,12 +189,143 @@ int sendProgramVariable(const char *name, uint8_t *program, size_t variableSize)
 
 bool camera_sign = false;
 
+#ifdef CAMERA
+// ---------------------------------------------------------------------------
+//  COLD-CAPTURE CAMERA MANAGEMENT
+//
+//  The OV5640 on the XIAO Sense expansion board has a documented hardware
+//  defect: the board's DVDD regulator outputs 1V3 where the sensor needs
+//  1V8+, so the sensor falls back to its own internal regulator, which
+//  dissipates ~127mW inside the sensor package. Within ~5 seconds of
+//  streaming the image goes dark and develops a purple haze.
+//
+//  Mitigation: keep the sensor powered DOWN except during an actual capture,
+//  and capture quickly once it's up. Stays inside the thermal budget.
+//  See: forum.arduino.cc/t/ov5640-solution-for-overheating/1420017
+// ---------------------------------------------------------------------------
+camera_config_t ti32_cam_config;
+bool camera_running = false;
+
+void buildCameraConfig()
+{
+  ti32_cam_config.ledc_channel = LEDC_CHANNEL_0;
+  ti32_cam_config.ledc_timer = LEDC_TIMER_0;
+  ti32_cam_config.pin_d0 = Y2_GPIO_NUM;
+  ti32_cam_config.pin_d1 = Y3_GPIO_NUM;
+  ti32_cam_config.pin_d2 = Y4_GPIO_NUM;
+  ti32_cam_config.pin_d3 = Y5_GPIO_NUM;
+  ti32_cam_config.pin_d4 = Y6_GPIO_NUM;
+  ti32_cam_config.pin_d5 = Y7_GPIO_NUM;
+  ti32_cam_config.pin_d6 = Y8_GPIO_NUM;
+  ti32_cam_config.pin_d7 = Y9_GPIO_NUM;
+  ti32_cam_config.pin_xclk = XCLK_GPIO_NUM;
+  ti32_cam_config.pin_pclk = PCLK_GPIO_NUM;
+  ti32_cam_config.pin_vsync = VSYNC_GPIO_NUM;
+  ti32_cam_config.pin_href = HREF_GPIO_NUM;
+  ti32_cam_config.pin_sscb_sda = SIOD_GPIO_NUM;
+  ti32_cam_config.pin_sscb_scl = SIOC_GPIO_NUM;
+  ti32_cam_config.pin_pwdn = PWDN_GPIO_NUM;
+  ti32_cam_config.pin_reset = RESET_GPIO_NUM;
+  // 10 MHz instead of 20 MHz. Halves the sensor's internal clock rate, which
+  // roughly halves its power draw and heat. Forum reports also specifically
+  // credit lowering XCLK with reducing the purple tint. Frame rate drops,
+  // which is irrelevant for single-shot stills.
+  ti32_cam_config.xclk_freq_hz = 10000000;
+  // XGA (1024x768). Lower resolution = pixel binning = ~4x more light per
+  // output pixel, less noise, lower sensor current. Still ~7 px/mm on paper
+  // at 10in, plenty for reading handwriting.
+  ti32_cam_config.frame_size = FRAMESIZE_XGA;
+  ti32_cam_config.pixel_format = PIXFORMAT_JPEG;
+  ti32_cam_config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  ti32_cam_config.fb_location = CAMERA_FB_IN_PSRAM;
+  ti32_cam_config.jpeg_quality = 10;
+  ti32_cam_config.fb_count = 1;
+
+  if (!psramFound()) {
+    ti32_cam_config.frame_size = FRAMESIZE_SVGA;
+    ti32_cam_config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+}
+
+void applySensorSettings()
+{
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+
+  bool is_ov5640 = (s->id.PID == 0x5640);
+  bool is_ov2640 = (s->id.PID == 0x26);
+
+  // GRAYSCALE — sidesteps the AWB colour-cast problem entirely, removes
+  // chroma noise, and vision models read monochrome text at least as well.
+  s->set_special_effect(s, 2);      // 0=none 1=negative 2=grayscale
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 0);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 3);             // 3 = "office" (fluorescent/LED)
+  s->set_exposure_ctrl(s, 1);
+  s->set_brightness(s, 2);
+  s->set_contrast(s, 2);
+  s->set_saturation(s, -2);
+  s->set_sharpness(s, 2);
+  s->set_denoise(s, 1);
+  s->set_gainceiling(s, GAINCEILING_16X);
+  s->set_ae_level(s, 2);
+  s->set_lenc(s, 1);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+  s->set_aec2(s, 1);
+
+  if (is_ov2640) {
+    s->set_dcw(s, 1);               // OV2640-only
+  }
+  if (is_ov5640) {
+    s->set_ae_level(s, 2);
+    s->set_quality(s, 8);
+  }
+
+  // ---- OPTIONAL HARDWARE-MOD-ONLY REGISTER ----
+  // Register 0x3031 bit[3] bypasses the sensor's internal DVDD regulator,
+  // which is what generates the heat. DO NOT enable this unless you have
+  // physically replaced the expansion board's 1V3 regulator with a 1V5 part
+  // (e.g. NCP115AMX150TCG). On a stock board this removes the digital core's
+  // only supply and the sensor browns out until a full power cycle.
+  //
+  // Uncomment ONLY after doing the hardware mod:
+  // s->set_reg(s, 0x3031, 0x08, 0x08);
+  // Serial.printf("0x3031 = 0x%02X\n", s->get_reg(s, 0x3031, 0xFF));
+}
+
+// Power up the sensor and apply settings. Returns true on success.
+bool cameraPowerUp()
+{
+  if (camera_running) return true;
+
+  esp_err_t err = esp_camera_init(&ti32_cam_config);
+  if (err != ESP_OK) {
+    Serial.printf("cameraPowerUp: init failed 0x%x\n", err);
+    return false;
+  }
+  applySensorSettings();
+  camera_running = true;
+  return true;
+}
+
+// Power the sensor back down so it stops streaming and cools off.
+void cameraPowerDown()
+{
+  if (!camera_running) return;
+  esp_camera_deinit();
+  camera_running = false;
+}
+#endif // CAMERA
+
 void setup()
 {
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.2 /// ===");
+  Serial.println("=== TI-32 v3.14-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -224,91 +359,24 @@ void setup()
 #ifdef CAMERA
   Serial.println("[camera]");
 
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  // UXGA (1600x1200) JPEG. Buffer in PSRAM. Quality 8 keeps detail crisp
-  // (a little better than 10) at ~200-350 KB per frame.
-  config.frame_size = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 8;
-  config.fb_count = 1;
+  buildCameraConfig();
 
-  // We keep fb_count=1 even with PSRAM — see comment above. The extra buffer
-  // doesn't fit alongside WiFi's heap allocations.
-  if (config.pixel_format == PIXFORMAT_JPEG && !psramFound())
-  {
-    // No PSRAM at all — fall back to smaller frames in regular DRAM.
-    config.frame_size = FRAMESIZE_SVGA;
-    config.fb_location = CAMERA_FB_IN_DRAM;
-  }
-  // If we have PSRAM + JPEG, keep the VGA / fb_count=1 / PSRAM settings
-  // configured above. (No else branch — the old chromalock code had one
-  // that forced 240x240 which is useless for our use case.)
-
-  // camera init
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK)
-  {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    return;
-  }
-  else
-  {
+  // Bring the sensor up once at boot purely to verify it works and log which
+  // sensor is fitted, then power it straight back down. From here on the
+  // sensor only runs during an actual capture — see the cold-capture note
+  // above cameraPowerUp().
+  if (!cameraPowerUp()) {
+    Serial.println("camera init FAILED");
+  } else {
+    sensor_t *s = esp_camera_sensor_get();
+    Serial.printf("sensor PID: 0x%04x ", s->id.PID);
+    Serial.println(s->id.PID == 0x5640 ? "(OV5640 - 5MP)" :
+                   s->id.PID == 0x26   ? "(OV2640 - 2MP)" : "(unknown)");
     Serial.println("camera ready");
-    camera_sign = true; // Camera initialization check passes
+    camera_sign = true;
+    cameraPowerDown();
+    Serial.println("camera powered down (cold-capture mode)");
   }
-
-  sensor_t *s = esp_camera_sensor_get();
-  // Color
-  s->set_special_effect(s, 0);
-  // Orientation. With the lens poking out the BACK of the calculator,
-  // pointing away from the user, the image comes back upside-down but not
-  // mirrored. Flip vertically only.
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 0);             // <-- was 1; that flipped the text
-  // Auto exposure / white balance ON
-  s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 0);             // 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
-  s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 1);
-  // Tuned for paper/text in indoor light, lens focused for ~10in.
-  s->set_brightness(s, 1);
-  s->set_contrast(s, 1);
-  s->set_saturation(s, -1);         // slightly desaturated — color noise is
-                                    //   useless for math text and confuses Claude
-  s->set_sharpness(s, 2);           // crank sharpening back up — lens focus
-                                    //   is now correct so sharpening recovers
-                                    //   real detail instead of amplifying blur
-  s->set_denoise(s, 1);
-  s->set_gainceiling(s, GAINCEILING_4X);
-  s->set_ae_level(s, 1);            // +1 — modest brightness bias (was +2)
-  s->set_lenc(s, 1);                // lens shading correction — fixes the
-                                    //   darker corners common on small CSI lenses
-  s->set_dcw(s, 1);                 // downsize cropping (improves edge quality
-                                    //   when the sensor scales internally)
-  s->set_bpc(s, 1);                 // bad-pixel correction
-  s->set_wpc(s, 1);                 // white-pixel correction
 #endif
 
   // WiFi init goes AFTER camera init so the camera gets first crack at
@@ -369,7 +437,13 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen)
   Serial.print("unlocked: ");
   Serial.println(unlocked);
 
-  // check for password
+  // No password required as of v3.4 — auto-unlock on first command.
+  // Set REQUIRE_PASSWORD to 1 to re-enable chromalock's anti-inspection
+  // password gate (calculator must Send(P) with PASSWORD value first).
+#define REQUIRE_PASSWORD 0
+
+  // Accept the password var either way, for back-compat with users who
+  // still type Send(P) out of habit.
   if (!unlocked && varName == 'P')
   {
     auto password = TIVar::realToLong8x(data, model);
@@ -383,6 +457,13 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen)
     {
       Serial.println("failed unlock");
     }
+  }
+
+  // With REQUIRE_PASSWORD off, the first command also unlocks the chip.
+  if (!unlocked && !REQUIRE_PASSWORD)
+  {
+    unlocked = true;
+    Serial.println("auto-unlocked (no password mode)");
   }
 
   if (!unlocked)
@@ -699,7 +780,9 @@ void gpt() {
   Serial.print("prompt: ");
   Serial.println(prompt);
 
-  fullResponse = "User: " + String(prompt) + " | AI: ";
+  // Don't prepend the prompt — it breaks the server's 16-char row padding
+  // and wastes screen space the user already knows the contents of.
+  fullResponse = "";
 
   auto url = String(SERVER) + String("/gpt/ask?question=") + urlEncode(String(prompt));
 
@@ -739,13 +822,16 @@ void send()
 
 void _sendLauncher()
 {
-  sendProgramVariable("TI32", __launcher_var, __launcher_var_len);
+  // The blob in launcher.h is the CAMERA program. Sending it under that name
+  // drops it straight into the calculator's PRGM list, so a RAM-cleared calc
+  // can be re-armed with 5->C : Send(C) and no computer.
+  sendProgramVariable("CAMERA", __launcher_var, __launcher_var_len);
 }
 
 void launcher()
 {
-  // we have to queue this action, since otherwise the transfer fails
-  // due to the CBL2 library still using the lines
+  // Queue it — the transfer fails if we start while the CBL2 library still
+  // has the link lines.
   queued_action = _sendLauncher;
   setSuccess("queued transfer");
 }
@@ -763,31 +849,63 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
   *outLen = 0;
 
   if (!camera_sign) {
-    Serial.println("captureAndPost: camera not initialized");
+    Serial.println("captureAndPost: camera not available");
     return -10;
   }
 
-  // Throw away several warmup frames. The OV2640's autoexposure and AWB
-  // converge over the first few frames; using the very first one gives a
-  // dark/over-exposed shot. 4 discarded frames + 200ms delay gives a stable
-  // exposure before we keep the next.
-  for (int i = 0; i < 4; ++i) {
+  // COLD CAPTURE. The sensor has been powered down since the last shot, so
+  // it's at ambient temperature and its first frames are clean. Power it up,
+  // grab quickly, power it back down.
+  unsigned long t0 = millis();
+  if (!cameraPowerUp()) {
+    Serial.println("captureAndPost: cameraPowerUp failed");
+    return -10;
+  }
+
+  // Discard a few frames so auto-exposure converges — but do it FAST with no
+  // inter-frame delays. There's a hard tradeoff here: the AEC needs a handful
+  // of frames to settle, while the sensor's self-heating starts visibly
+  // degrading the image after roughly 5 seconds of streaming. 5 back-to-back
+  // frames at 10MHz XCLK lands around 1 second, which gets most of the AEC
+  // convergence while staying well inside the thermal budget.
+  for (int i = 0; i < 5; ++i) {
     camera_fb_t *warmup = esp_camera_fb_get();
     if (warmup) esp_camera_fb_return(warmup);
   }
-  delay(200);
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("captureAndPost: esp_camera_fb_get returned NULL");
+    cameraPowerDown();
     return -11;
   }
   if (fb->format != PIXFORMAT_JPEG) {
     Serial.println("captureAndPost: frame is not JPEG");
     esp_camera_fb_return(fb);
+    cameraPowerDown();
     return -12;
   }
+  Serial.printf("sensor was powered up for %lu ms before capture\n",
+                millis() - t0);
   Serial.printf("captured %u bytes (%ux%u)\n", (unsigned)fb->len, fb->width, fb->height);
+
+  // Copy the JPEG into our own PSRAM buffer, then power the sensor down
+  // BEFORE the upload. The POST takes 2-5 seconds over a phone hotspot —
+  // leaving the sensor streaming through all of that is exactly the
+  // self-heating we're trying to avoid. esp_camera_deinit() also frees the
+  // frame buffer pool, so we can't hold a pointer into it across the call.
+  size_t jpeg_len = fb->len;
+  uint8_t *jpeg = (uint8_t *)ps_malloc(jpeg_len);
+  if (!jpeg) {
+    Serial.println("captureAndPost: ps_malloc for JPEG copy failed");
+    esp_camera_fb_return(fb);
+    cameraPowerDown();
+    return -13;
+  }
+  memcpy(jpeg, fb->buf, jpeg_len);
+  esp_camera_fb_return(fb);
+  cameraPowerDown();
+  Serial.printf("sensor powered down; uploading %u bytes\n", (unsigned)jpeg_len);
   Serial.printf("free heap before POST: %u  PSRAM found: %d\n",
                 (unsigned)ESP.getFreeHeap(), (int)psramFound());
 
@@ -810,14 +928,13 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
   // bodyParser is now configured to accept any image/* type.
   http.addHeader("Content-Type", "image/jpeg");
 
-  int status = http.POST(fb->buf, fb->len);
+  int status = http.POST(jpeg, jpeg_len);
   Serial.print("POST ");
   Serial.print(url);
   Serial.print(" -> ");
   Serial.println(status);
 
-  // Done with the frame buffer regardless of how the POST went.
-  esp_camera_fb_return(fb);
+  free(jpeg);
 
   if (status > 0 && status < 400) {
     String body = http.getString();

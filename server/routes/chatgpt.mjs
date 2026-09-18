@@ -36,6 +36,56 @@ function saveLastSnap(buf) {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  TI-84 Plus screen fitting
+//
+//  The TI-84 Plus home screen is 96x64 pixels = exactly 16 characters wide
+//  by 8 rows (6x8 px per character cell). The CAMERA program uses rows 1-6
+//  for text and reserves row 8 for the nav hint, so one page is
+//  6 rows x 16 cols = 96 characters.
+//
+//  We word-wrap here on the server and pad every line to exactly 16 chars.
+//  That way the calculator can slice the string into fixed 16-char rows with
+//  sub() and nothing ever breaks mid-word or runs off the right edge.
+// ---------------------------------------------------------------------------
+const CALC_COLS = 16;
+const CALC_TEXT_ROWS = 6;
+export const CALC_PAGE_CHARS = CALC_COLS * CALC_TEXT_ROWS; // 96
+
+function wrapForCalc(text) {
+  const words = String(text ?? "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+
+  const lines = [];
+  let cur = "";
+
+  for (const w of words) {
+    if (w.length > CALC_COLS) {
+      // A single token too long for one row — hard-break it.
+      if (cur) { lines.push(cur); cur = ""; }
+      let rest = w;
+      while (rest.length > CALC_COLS) {
+        lines.push(rest.slice(0, CALC_COLS));
+        rest = rest.slice(CALC_COLS);
+      }
+      cur = rest;
+      continue;
+    }
+    if (!cur) cur = w;
+    else if (cur.length + 1 + w.length <= CALC_COLS) cur += " " + w;
+    else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+
+  // Pad every line to exactly CALC_COLS so the calculator's fixed-width
+  // slicing lines up, then concatenate with no separators.
+  return lines.map((l) => l.padEnd(CALC_COLS, " ")).join("");
+}
+
 // Server-side enhancement pipeline for OV2640 frames before they go to Claude.
 // The OV2640 + tiny aperture + handheld setup produces images that are dark,
 // soft, and grainy in typical indoor light. Sharp can recover a lot of that:
@@ -58,14 +108,18 @@ async function enhanceForVision(inputBuf) {
 }
 
 const SYSTEM_PROMPT_ASK =
-  "You are answering a question for someone reading a tiny calculator screen. " +
-  "Be brief. Plain text only — no emojis, no markdown formatting.";
+  "You are answering a question shown on a TI-84 calculator screen. " +
+  "The screen shows 16 characters per line and 6 lines at a time, so aim for " +
+  "under 90 characters total. Plain ASCII only - no emojis, no markdown, no " +
+  "special symbols. Be direct: give the answer, not a preamble.";
 
 const SYSTEM_PROMPT_SOLVE =
   "You are a math/science tutor answering a question shown in a photo. " +
-  "Reply as briefly as possible. If the question is multiple choice, give the letter only. " +
-  "Otherwise give just the final answer plus, at most, one short sentence of work. " +
-  "Do not use emojis or markdown. The reader is looking at a tiny calculator screen.";
+  "Your answer is displayed on a TI-84 calculator: 16 characters per line, " +
+  "6 lines visible at a time. Keep the whole reply under 90 characters if you " +
+  "possibly can. If the question is multiple choice, reply with just the letter. " +
+  "Otherwise give the final answer, plus at most one very short sentence of work. " +
+  "Plain ASCII only - no emojis, no markdown, no special symbols.";
 
 const USE_OPENAI_ASK = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_ASK === "1";
 const USE_OPENAI_SOLVE = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_SOLVE === "1";
@@ -133,7 +187,7 @@ export async function chatgpt() {
           .join("\n")
           .trim() || "no response";
       }
-      res.send(answer);
+      res.send(wrapForCalc(answer));
     } catch (e) {
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
@@ -274,7 +328,7 @@ export async function chatgpt() {
       }
 
       console.log("answer:", answer);
-      res.send(answer);
+      res.send(wrapForCalc(answer));
     } catch (e) {
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
