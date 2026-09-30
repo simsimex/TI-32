@@ -201,6 +201,19 @@ const CHAT_MAX_TURNS = 6;      // follow-up exchanges kept after the photo turn
 const USE_OPENAI_ASK = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_ASK === "1";
 const USE_OPENAI_SOLVE = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_SOLVE === "1";
 
+// Pull the text out of a Claude response. Current models think before they
+// answer (adaptive thinking) and that thinking counts against max_tokens, so
+// a too-small budget can yield thinking blocks and NO text. When that
+// happens, say why instead of a bare "no response".
+function textFrom(result) {
+  const blocks = result?.content ?? [];
+  const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join(" ").trim();
+  console.log(`claude: stop=${result?.stop_reason} blocks=[${blocks.map((b) => b.type).join(",")}] ` +
+              `in=${result?.usage?.input_tokens} out=${result?.usage?.output_tokens}`);
+  if (text) return text;
+  return `No answer from Claude (stop reason: ${result?.stop_reason ?? "unknown"}).`;
+}
+
 export async function chatgpt() {
   const routes = express.Router();
 
@@ -254,15 +267,11 @@ export async function chatgpt() {
         const client = await getAnthropic();
         const result = await client.messages.create({
           model: ANTHROPIC_MODEL,
-          max_tokens: 512,
+          max_tokens: 8000,
           system: SYSTEM_PROMPT_ASK,
           messages: [{ role: "user", content: String(question) }],
         });
-        answer = (result.content ?? [])
-          .filter((b) => b.type === "text")
-          .map((b) => b.text)
-          .join("\n")
-          .trim() || "no response";
+        answer = textFrom(result);
       }
       res.send(wrapForCalc(answer));
     } catch (e) {
@@ -379,7 +388,7 @@ export async function chatgpt() {
         const client = await getAnthropic();
         const result = await client.messages.create({
           model: ANTHROPIC_MODEL,
-          max_tokens: 512,
+          max_tokens: 8000,
           system: SYSTEM_PROMPT_SOLVE,
           messages: [
             {
@@ -398,11 +407,7 @@ export async function chatgpt() {
             },
           ],
         });
-        answer = (result.content ?? [])
-          .filter((b) => b.type === "text")
-          .map((b) => b.text)
-          .join("\n")
-          .trim() || "no response";
+        answer = textFrom(result);
       }
 
       console.log("answer:", answer);
@@ -448,15 +453,11 @@ export async function chatgpt() {
 
       const result = await client.messages.create({
         model: ANTHROPIC_MODEL,
-        max_tokens: 512,
+        max_tokens: 8000,
         system: hasPhoto ? SYSTEM_PROMPT_CHAT : SYSTEM_PROMPT_ASK,
         messages,
       });
-      const answer = (result.content ?? [])
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim() || "no response";
+      const answer = textFrom(result);
 
       if (hasPhoto) {
         chatHistory.push({ role: "user", content: question });
@@ -489,15 +490,11 @@ export async function chatgpt() {
       const ask = "Explain the full solution step by step.";
       const result = await client.messages.create({
         model: ANTHROPIC_MODEL,
-        max_tokens: 1200,
+        max_tokens: 16000,
         system: SYSTEM_PROMPT_EXPLAIN,
         messages: [...chatHistory, { role: "user", content: ask }],
       });
-      const answer = (result.content ?? [])
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join(" ")
-        .trim() || "no response";
+      const answer = textFrom(result);
 
       chatHistory.push({ role: "user", content: ask });
       chatHistory.push({ role: "assistant", content: answer });
