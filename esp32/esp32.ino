@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.20-OV5640 (chat + firmware word-wrap) ///
+//   TI-32 FIRMWARE v3.22-OV5640 (EXPLAIN option) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -101,6 +101,7 @@ void sendPage();
 void reply();
 void clearChat(); 
 void chat();
+void explain();
 String wrapForCalc(const String &in);
 
 struct Command
@@ -130,13 +131,14 @@ struct Command commands[] = {
     { 16, "reply", 1, reply, true },
     { 17, "clearChat", 1, clearChat, true}, 
     { 18, "chat", 1, chat, true },        // follow-up question about the last photo
+    { 19, "explain", 0, explain, true },  // full worked solution for the last photo
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
 // Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
 // actually dispatched by loop(). The camera commands snap(7) and solve(8) are
 // already <= 14, but enabling everything keeps the launcher/UI features working.
-constexpr int MAXCOMMAND = 18;
+constexpr int MAXCOMMAND = 19;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -356,7 +358,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.20-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.22-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -878,7 +880,11 @@ static String asciiFor(uint32_t cp)
     case 0x00B0: return " deg";
     case 0x03C0: return "pi";
     case 0x221A: return "sqrt";
-    case 0x2248: return "~";
+    case 0x2248: return " APPROX ";
+    case 0x03A9: case 0x2126: return " OHM";      // resistance
+    case 0x2225: return "//";                     // parallel (R1//R2)
+    case 0x00B5: case 0x03BC: return "U";         // micro
+    case 0x2022: case 0x00B7: return "-";         // bullets
     case 0x2260: return "!=";
     case 0x2264: return "<=";
     case 0x2265: return ">=";
@@ -893,6 +899,31 @@ static String asciiFor(uint32_t cp)
   }
 }
 
+// ArTICL's string converter (TI-82-style mapping, which this calculator uses)
+// only supports: A-Z 0-9 space ! " ' ( ) * + , - . / : < = > ? [ ] ^ { }
+// Lowercase is uppercased. Any OTHER printable ASCII hits a switch with no
+// matching case and leaves the output token uninitialised, which in practice
+// re-sends the previous character — e.g. "12||16||8" arrived as "122216668".
+// Translate those characters here so the library never sees them.
+static String tiSafeAscii(char c)
+{
+  if (c < 0x20 || c == 0x7F) return " ";
+  switch (c) {
+    case '|':  return "/";        // "12||16" -> "12//16" (parallel notation)
+    case '#':  return "NO.";
+    case '$':  return "USD";
+    case '%':  return " PCT";
+    case '&':  return " AND ";
+    case ';':  return ",";
+    case '@':  return " AT ";
+    case '\\': return "/";
+    case '_':  return "-";
+    case '`':  return "'";
+    case '~':  return " APPROX ";
+    default:   return String(c);
+  }
+}
+
 String wrapForCalc(const String &in)
 {
   const int COLS = 16;
@@ -904,7 +935,7 @@ String wrapForCalc(const String &in)
   for (int i = 0; i < n; ) {
     uint8_t c = (uint8_t)in[i];
     if (c < 0x80) {
-      clean += (c < 0x20 || c == 0x7F) ? ' ' : (char)c;   // newlines/tabs -> space
+      clean += tiSafeAscii((char)c);   // newlines/tabs -> space, unsupported -> words
       i++;
       continue;
     }
@@ -950,16 +981,11 @@ String wrapForCalc(const String &in)
   return out;
 }
 
-// CHAT (command 18): send a typed follow-up question to /gpt/chat. The server
-// remembers the most recent photo and answer, so this continues that
-// conversation. Uses its own HTTP call (30 s timeout + getString) rather than
-// makeRequest(), whose 5 s default timeout is too short for a Claude call.
-void chat()
+// GET a server route and load the reply into the pager. Shared by CHAT and
+// EXPLAIN. Own HTTP call (30-45 s timeout + getString) rather than
+// makeRequest(), whose 5 s default is too short for a Claude call.
+static void fetchToPager(const String &url, uint32_t timeoutMs)
 {
-  const char *q = strArgs[0];
-  Serial.print("chat question: ");
-  Serial.println(q);
-
 #ifdef SECURE
   WiFiClientSecure client;
   client.setInsecure();
@@ -967,27 +993,41 @@ void chat()
   WiFiClient client;
 #endif
   HTTPClient http;
-  http.setTimeout(30000);
-  String url = String(SERVER) + "/gpt/chat?question=" + urlEncode(String(q));
+  http.setTimeout(timeoutMs);
   http.begin(client, url.c_str());
   int code = http.GET();
-  Serial.printf("GET /gpt/chat -> %d\n", code);
+  Serial.printf("GET %s -> %d\n", url.c_str(), code);
 
   if (code != 200) {
     http.end();
     char e[40];
-    snprintf(e, sizeof(e), "chat http %d", code);
+    snprintf(e, sizeof(e), "server error %d", code);
     fullResponse = wrapForCalc(String(e));
-    PAGE_PAGE = 0;
-    sendPage();
-    return;
+  } else {
+    String body = http.getString();
+    http.end();
+    fullResponse = wrapForCalc(body);
   }
-  String body = http.getString();
-  http.end();
-
-  fullResponse = wrapForCalc(body);
   PAGE_PAGE = 0;
   sendPage();
+}
+
+// CHAT (command 18): typed follow-up about the most recent photo. The server
+// remembers the photo and prior answers, so this continues that conversation.
+void chat()
+{
+  const char *q = strArgs[0];
+  Serial.print("chat question: ");
+  Serial.println(q);
+  fetchToPager(String(SERVER) + "/gpt/chat?question=" + urlEncode(String(q)), 30000);
+}
+
+// EXPLAIN (command 19): full worked solution for the most recent photo.
+// Longer answer = more tokens to generate, so a longer timeout.
+void explain()
+{
+  Serial.println("explain requested");
+  fetchToPager(String(SERVER) + "/gpt/explain", 45000);
 }
 
 void sendPage() {

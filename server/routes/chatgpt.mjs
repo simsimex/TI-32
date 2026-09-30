@@ -111,7 +111,11 @@ const SYSTEM_PROMPT_ASK =
   "You are answering a question shown on a TI-84 calculator screen. " +
   "The screen shows 16 characters per line and 6 lines at a time, so aim for " +
   "under 90 characters total. Plain ASCII only - no emojis, no markdown, no " +
-  "special symbols. Be direct: give the answer, not a preamble.";
+  "special symbols. Be direct: give the answer, not a preamble. " +
+  "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
+  "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
+  "symbol. Write ohm, pi, sqrt(), x^2, >=, and // for parallel resistors. " +
+  "No bullet lists or line breaks - write in plain sentences.";
 
 const SYSTEM_PROMPT_SOLVE =
   "You are a math/science tutor answering a question shown in a photo. " +
@@ -119,7 +123,11 @@ const SYSTEM_PROMPT_SOLVE =
   "6 lines visible at a time. Keep the whole reply under 90 characters if you " +
   "possibly can. If the question is multiple choice, reply with just the letter. " +
   "Otherwise give the final answer, plus at most one very short sentence of work. " +
-  "Plain ASCII only - no emojis, no markdown, no special symbols.";
+  "Plain ASCII only - no emojis, no markdown, no special symbols. " +
+  "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
+  "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
+  "symbol. Write ohm, pi, sqrt(), x^2, >=, and // for parallel resistors. " +
+  "No bullet lists or line breaks - write in plain sentences.";
 
 const SYSTEM_PROMPT_CHAT =
   "You are a math/science tutor having a follow-up conversation about a " +
@@ -129,7 +137,24 @@ const SYSTEM_PROMPT_CHAT =
   "user explicitly asks for more detail. Plain ASCII only: no emojis, no " +
   "markdown, no special symbols (write x^2, sqrt, pi, >= instead). " +
   "The user types on a calculator keypad, so their questions may be in all " +
-  "caps and tersely worded.";
+  "caps and tersely worded. " +
+  "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
+  "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
+  "symbol. Write ohm, pi, sqrt(), x^2, >=, and // for parallel resistors. " +
+  "No bullet lists or line breaks - write in plain sentences.";
+
+const SYSTEM_PROMPT_EXPLAIN =
+  "You are a math/science tutor. The user photographed a problem (first " +
+  "message) and got a short answer. Now give a complete worked solution: " +
+  "identify what the problem is asking, state the method, and show each step " +
+  "with the numbers, ending with the final answer. If the short answer was " +
+  "wrong, say so and correct it. Your reply is read on a TI-84 calculator, " +
+  "16 characters per line, paged 6 lines at a time, so be thorough but " +
+  "economical: aim for 300-700 characters. Plain sentences, no markdown, no " +
+  "bullet lists, no line breaks. " +
+  "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
+  "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
+  "symbol. Write ohm, pi, sqrt(), x^2, >=, e^(-t/2), and // for parallel resistors.";
 
 // Conversation memory for CHAT. Reset every time a new photo is solved, so
 // follow-ups always refer to the most recent question. Lives in process
@@ -403,6 +428,44 @@ export async function chatgpt() {
       }
 
       console.log(`/chat q="${question}" -> ${answer}`);
+      res.send(wrapForCalc(answer));
+    } catch (e) {
+      console.error(e);
+      res.status(500).send(String(e?.message ?? e));
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // GET /gpt/explain — full worked solution for the most recent photo.
+  // Reuses the photo + short answer from the last /solve (same memory CHAT
+  // uses), and appends the explanation so CHAT follow-ups can refer to it.
+  // --------------------------------------------------------------------------
+  routes.get("/explain", async (req, res) => {
+    if (chatHistory.length === 0) {
+      res.send(wrapForCalc("Solve a problem first, then pick EXPLAIN."));
+      return;
+    }
+    try {
+      const client = await getAnthropic();
+      const ask = "Explain the full solution step by step.";
+      const result = await client.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 1200,
+        system: SYSTEM_PROMPT_EXPLAIN,
+        messages: [...chatHistory, { role: "user", content: ask }],
+      });
+      const answer = (result.content ?? [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join(" ")
+        .trim() || "no response";
+
+      chatHistory.push({ role: "user", content: ask });
+      chatHistory.push({ role: "assistant", content: answer });
+      const tail = chatHistory.slice(2).slice(-CHAT_MAX_TURNS * 2);
+      chatHistory = [...chatHistory.slice(0, 2), ...tail];
+
+      console.log(`/explain -> ${answer.length} chars: ${answer}`);
       res.send(wrapForCalc(answer));
     } catch (e) {
       console.error(e);
