@@ -121,6 +121,22 @@ const SYSTEM_PROMPT_SOLVE =
   "Otherwise give the final answer, plus at most one very short sentence of work. " +
   "Plain ASCII only - no emojis, no markdown, no special symbols.";
 
+const SYSTEM_PROMPT_CHAT =
+  "You are a math/science tutor having a follow-up conversation about a " +
+  "question the user photographed earlier (the photo is the first message). " +
+  "Your reply is shown on a TI-84 calculator: 16 characters per line, 6 lines " +
+  "per screen. Be brief and direct - aim for under 90 characters unless the " +
+  "user explicitly asks for more detail. Plain ASCII only: no emojis, no " +
+  "markdown, no special symbols (write x^2, sqrt, pi, >= instead). " +
+  "The user types on a calculator keypad, so their questions may be in all " +
+  "caps and tersely worded.";
+
+// Conversation memory for CHAT. Reset every time a new photo is solved, so
+// follow-ups always refer to the most recent question. Lives in process
+// memory only (clears on a Render restart — fine for this use).
+let chatHistory = [];          // Anthropic messages array
+const CHAT_MAX_TURNS = 6;      // follow-up exchanges kept after the photo turn
+
 const USE_OPENAI_ASK = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_ASK === "1";
 const USE_OPENAI_SOLVE = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_SOLVE === "1";
 
@@ -328,6 +344,65 @@ export async function chatgpt() {
       }
 
       console.log("answer:", answer);
+
+      // Seed CHAT with this photo and answer so follow-ups have context.
+      chatHistory = [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64Image } },
+            { type: "text", text: userText },
+          ],
+        },
+        { role: "assistant", content: answer },
+      ];
+
+      res.send(wrapForCalc(answer));
+    } catch (e) {
+      console.error(e);
+      res.status(500).send(String(e?.message ?? e));
+    }
+  });
+
+  // --------------------------------------------------------------------------
+  // GET /gpt/chat?question=...  — follow-up about the most recent photo.
+  // Claude sees the original image, its first answer, and prior follow-ups.
+  // If nothing has been solved yet, it just answers the question directly.
+  // --------------------------------------------------------------------------
+  routes.get("/chat", async (req, res) => {
+    const question = String(req.query.question ?? "").trim();
+    if (!question) {
+      res.send(wrapForCalc("Type a question first."));
+      return;
+    }
+    try {
+      const client = await getAnthropic();
+      const hasPhoto = chatHistory.length > 0;
+      const messages = hasPhoto
+        ? [...chatHistory, { role: "user", content: question }]
+        : [{ role: "user", content: question }];
+
+      const result = await client.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 512,
+        system: hasPhoto ? SYSTEM_PROMPT_CHAT : SYSTEM_PROMPT_ASK,
+        messages,
+      });
+      const answer = (result.content ?? [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim() || "no response";
+
+      if (hasPhoto) {
+        chatHistory.push({ role: "user", content: question });
+        chatHistory.push({ role: "assistant", content: answer });
+        // Keep the photo turn (first 2 messages) + the most recent follow-ups.
+        const tail = chatHistory.slice(2).slice(-CHAT_MAX_TURNS * 2);
+        chatHistory = [...chatHistory.slice(0, 2), ...tail];
+      }
+
+      console.log(`/chat q="${question}" -> ${answer}`);
       res.send(wrapForCalc(answer));
     } catch (e) {
       console.error(e);

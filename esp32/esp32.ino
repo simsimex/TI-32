@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.14-OV5640 (cold-capture + screen fit + launcher) ///
+//   TI-32 FIRMWARE v3.20-OV5640 (chat + firmware word-wrap) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -28,6 +28,12 @@
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "./camera_pins.h"
 #include "./camera_index.h"
+// OV5640 autofocus. The OV5640 module is a VCM (voice-coil) autofocus part;
+// its focus motor is driven by firmware that must be uploaded to the sensor
+// after every power-up. Without it the lens sits at its default,
+// out-of-focus position. Library: "OV5640 Auto Focus for ESP32 Camera"
+// (github.com/0015/ESP32-OV5640-AF), installed in Arduino/libraries.
+#include "ESP32_OV5640_AF.h"
 #endif
 
 // Video-2 wiring (no PCB, hand-soldered): D0 = TIP, D2 = RING.
@@ -94,6 +100,8 @@ void fetch_program();
 void sendPage();
 void reply();
 void clearChat(); 
+void chat();
+String wrapForCalc(const String &in);
 
 struct Command
 {
@@ -121,13 +129,14 @@ struct Command commands[] = {
     { 15, "sendPage", 1, sendPage, true },
     { 16, "reply", 1, reply, true },
     { 17, "clearChat", 1, clearChat, true}, 
+    { 18, "chat", 1, chat, true },        // follow-up question about the last photo
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
 // Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
 // actually dispatched by loop(). The camera commands snap(7) and solve(8) are
 // already <= 14, but enabling everything keeps the launcher/UI features working.
-constexpr int MAXCOMMAND = 17;
+constexpr int MAXCOMMAND = 18;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -205,6 +214,8 @@ bool camera_sign = false;
 // ---------------------------------------------------------------------------
 camera_config_t ti32_cam_config;
 bool camera_running = false;
+OV5640 ti32_af = OV5640();
+bool af_ready = false;   // true once AF firmware is loaded this power cycle
 
 void buildCameraConfig()
 {
@@ -226,15 +237,13 @@ void buildCameraConfig()
   ti32_cam_config.pin_sscb_scl = SIOC_GPIO_NUM;
   ti32_cam_config.pin_pwdn = PWDN_GPIO_NUM;
   ti32_cam_config.pin_reset = RESET_GPIO_NUM;
-  // 10 MHz instead of 20 MHz. Halves the sensor's internal clock rate, which
-  // roughly halves its power draw and heat. Forum reports also specifically
-  // credit lowering XCLK with reducing the purple tint. Frame rate drops,
-  // which is irrelevant for single-shot stills.
-  ti32_cam_config.xclk_freq_hz = 10000000;
-  // XGA (1024x768). Lower resolution = pixel binning = ~4x more light per
-  // output pixel, less noise, lower sensor current. Still ~7 px/mm on paper
-  // at 10in, plenty for reading handwriting.
-  ti32_cam_config.frame_size = FRAMESIZE_XGA;
+  // 20 MHz: the reference XCLK the esp32-camera OV5640 driver and Seeed's
+  // examples are tuned for. (Heat is handled by cold-capture plus the
+  // 0x302C output-drive fix in cameraPowerUp, not by underclocking.)
+  ti32_cam_config.xclk_freq_hz = 20000000;
+  // SXGA (1280x1024). Seeed's official OV5640 AF examples run AF at SXGA,
+  // so capturing at the same size means no framesize switch after focusing.
+  ti32_cam_config.frame_size = FRAMESIZE_SXGA;
   ti32_cam_config.pixel_format = PIXFORMAT_JPEG;
   ti32_cam_config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   ti32_cam_config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -252,36 +261,33 @@ void applySensorSettings()
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
 
-  bool is_ov5640 = (s->id.PID == 0x5640);
   bool is_ov2640 = (s->id.PID == 0x26);
 
-  // GRAYSCALE — sidesteps the AWB colour-cast problem entirely, removes
-  // chroma noise, and vision models read monochrome text at least as well.
-  s->set_special_effect(s, 2);      // 0=none 1=negative 2=grayscale
+  // Near-default tuning. Earlier builds cranked everything to +2, which made
+  // quality worse: max sharpening on 16x gain amplifies sensor noise, max
+  // contrast crushes shadows, and max brightness + max exposure comp washes
+  // out white paper. The real problem was focus, not tuning.
+  s->set_special_effect(s, 0);      // 0 = normal colour (2 = grayscale)
   s->set_vflip(s, 1);
   s->set_hmirror(s, 0);
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 3);             // 3 = "office" (fluorescent/LED)
+  s->set_wb_mode(s, 0);             // auto
   s->set_exposure_ctrl(s, 1);
-  s->set_brightness(s, 2);
-  s->set_contrast(s, 2);
-  s->set_saturation(s, -2);
-  s->set_sharpness(s, 2);
-  s->set_denoise(s, 1);
-  s->set_gainceiling(s, GAINCEILING_16X);
-  s->set_ae_level(s, 2);
+  s->set_gain_ctrl(s, 1);
+  s->set_brightness(s, 1);          // +1: modest lift for indoor light
+  s->set_contrast(s, 1);            // +1: a little punch for ink on paper
+  s->set_saturation(s, 0);
+  s->set_sharpness(s, 1);
+  s->set_ae_level(s, 1);            // +1 exposure compensation
+  s->set_gainceiling(s, GAINCEILING_8X);  // more headroom in dim rooms
   s->set_lenc(s, 1);
   s->set_bpc(s, 1);
   s->set_wpc(s, 1);
-  s->set_aec2(s, 1);
 
   if (is_ov2640) {
-    s->set_dcw(s, 1);               // OV2640-only
-  }
-  if (is_ov5640) {
-    s->set_ae_level(s, 2);
-    s->set_quality(s, 8);
+    s->set_aec2(s, 1);
+    s->set_dcw(s, 1);
   }
 
   // ---- OPTIONAL HARDWARE-MOD-ONLY REGISTER ----
@@ -306,8 +312,33 @@ bool cameraPowerUp()
     Serial.printf("cameraPowerUp: init failed 0x%x\n", err);
     return false;
   }
-  applySensorSettings();
   camera_running = true;
+  af_ready = false;
+
+  sensor_t *s = esp_camera_sensor_get();
+  bool is_ov5640 = s && (s->id.PID == 0x5640);
+
+  if (is_ov5640) {
+    // HEAT FIX (from Seeed's merged example PR #26): register 0x302C
+    // bits[7:6] set the sensor's output pad drive strength. Default 11 = 4x,
+    // which runs hot. 00 = 1x is enough for the short board-level traces on
+    // the XIAO and noticeably cooler. Must be set before AF/framesize calls.
+    s->set_reg(s, 0x302C, 0xC0, 0x00);
+  }
+
+  applySensorSettings();
+
+  if (is_ov5640) {
+    // Upload the AF firmware (~4 KB over SCCB) and start continuous AF.
+    // Re-done on every power-up because esp_camera_deinit() drops it.
+    unsigned long t = millis();
+    ti32_af.start(s);
+    uint8_t r1 = ti32_af.focusInit();
+    uint8_t r2 = (r1 == 0) ? ti32_af.autoFocusMode() : 0xFF;
+    af_ready = (r1 == 0 && r2 == 0);
+    Serial.printf("AF firmware %s (init=%u mode=%u) in %lu ms\n",
+                  af_ready ? "loaded" : "FAILED", r1, r2, millis() - t);
+  }
   return true;
 }
 
@@ -325,7 +356,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.14-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.20-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -589,8 +620,24 @@ int onRequest(uint8_t type, enum Endpoint model, int *headerlen, int *datalen, d
     {
       return -1;
     }
-    // TODO right now, the only string variable will be the message, but ill need to allow for other vars later
-    *datalen = TIVar::stringToStrVar8x(String(message), data, model);
+    // Every string we hand the calculator is padded to exactly PAGE_SIZE
+    // (96) characters = 6 rows x 16 cols on the TI-84 Plus home screen.
+    //
+    // Why: the calculator displays it with Output(1,1,Str0), which wraps at
+    // the 16-char row boundary. A fixed 96-char payload means the text always
+    // lays out as exactly 6 full rows with no ragged edge, and short messages
+    // blank out the rest of the screen instead of leaving stale pixels.
+    //
+    // Padding also guarantees we never send a zero-length string variable,
+    // which makes the calculator throw ERR:INVALID DIM.
+    {
+      String outStr = String(message);
+      if (outStr.length() > (unsigned)PAGE_SIZE) {
+        outStr = outStr.substring(0, PAGE_SIZE);
+      }
+      while (outStr.length() < (unsigned)PAGE_SIZE) outStr += " ";
+      *datalen = TIVar::stringToStrVar8x(outStr, data, model);
+    }
     TIVar::intToSizeWord(*datalen, header);
     header[2] = VarTypes82::VarString;
     header[3] = 0xAA;
@@ -800,11 +847,183 @@ void gpt() {
   sendPage();
 }
 
+// ---------------------------------------------------------------------------
+//  wrapForCalc — lay text out for the TI-84 Plus home screen (16 cols).
+//
+//  1. Sanitize to characters the calculator can display. ArTICL's string
+//     converter silently DROPS any byte >= 0x7F, so a curly quote or a "x"
+//     multiplication sign would vanish and shift every later character,
+//     knocking the row alignment off. Common Unicode is translated to ASCII
+//     first; anything else is removed as a whole character.
+//  2. Greedy word wrap: if the next word doesn't fit on the current 16-char
+//     row, it moves to the next row. Words are never split unless a single
+//     word is longer than 16 characters.
+//  3. Pad every row to exactly 16 chars and concatenate, so Output(1,1,Str0)
+//     and the 96-char pages both land exactly on row boundaries.
+//
+//  Done here (not only on the server) because this is the last step before
+//  the bytes reach the calculator — it's the only place that knows exactly
+//  what will be displayed.
+// ---------------------------------------------------------------------------
+static String asciiFor(uint32_t cp)
+{
+  switch (cp) {
+    case 0x2018: case 0x2019: case 0x2032: return "'";
+    case 0x201C: case 0x201D: case 0x2033: return "\"";
+    case 0x2013: case 0x2014: case 0x2212: return "-";
+    case 0x00D7: case 0x22C5: case 0x2219: return "*";
+    case 0x00F7: return "/";
+    case 0x00B2: return "^2";
+    case 0x00B3: return "^3";
+    case 0x00B0: return " deg";
+    case 0x03C0: return "pi";
+    case 0x221A: return "sqrt";
+    case 0x2248: return "~";
+    case 0x2260: return "!=";
+    case 0x2264: return "<=";
+    case 0x2265: return ">=";
+    case 0x00B1: return "+/-";
+    case 0x2026: return "...";
+    case 0x2192: return "->";
+    case 0x221E: return "inf";
+    case 0x0394: return "delta";
+    case 0x03B8: return "theta";
+    case 0x00A0: return " ";
+    default: return "";              // unknown symbol: drop it cleanly
+  }
+}
+
+String wrapForCalc(const String &in)
+{
+  const int COLS = 16;
+
+  // --- 1. sanitize (decode UTF-8, map to ASCII) ---
+  String clean;
+  clean.reserve(in.length());
+  int n = in.length();
+  for (int i = 0; i < n; ) {
+    uint8_t c = (uint8_t)in[i];
+    if (c < 0x80) {
+      clean += (c < 0x20 || c == 0x7F) ? ' ' : (char)c;   // newlines/tabs -> space
+      i++;
+      continue;
+    }
+    int extra = (c >= 0xF0) ? 3 : (c >= 0xE0) ? 2 : (c >= 0xC0) ? 1 : 0;
+    uint32_t cp = (extra == 3) ? (c & 0x07) : (extra == 2) ? (c & 0x0F) : (c & 0x1F);
+    i++;
+    for (int k = 0; k < extra && i < n; k++, i++) cp = (cp << 6) | ((uint8_t)in[i] & 0x3F);
+    clean += asciiFor(cp);
+  }
+
+  // --- 2 + 3. greedy word wrap, pad rows to 16 ---
+  String out;
+  String line;
+  int p = 0, L = clean.length();
+  while (p < L) {
+    while (p < L && clean[p] == ' ') p++;          // skip spaces
+    if (p >= L) break;
+    int q = p;
+    while (q < L && clean[q] != ' ') q++;
+    String word = clean.substring(p, q);
+    p = q;
+
+    while (word.length() > (unsigned)COLS) {        // over-long token: hard break
+      if (line.length()) { while (line.length() < (unsigned)COLS) line += ' '; out += line; line = ""; }
+      out += word.substring(0, COLS);
+      word = word.substring(COLS);
+    }
+    if (!word.length()) continue;
+
+    if (!line.length()) {
+      line = word;
+    } else if (line.length() + 1 + word.length() <= (unsigned)COLS) {
+      line += ' ';
+      line += word;
+    } else {                                        // doesn't fit: new row
+      while (line.length() < (unsigned)COLS) line += ' ';
+      out += line;
+      line = word;
+    }
+  }
+  if (line.length()) { while (line.length() < (unsigned)COLS) line += ' '; out += line; }
+  if (!out.length()) out = "NO RESPONSE";
+  return out;
+}
+
+// CHAT (command 18): send a typed follow-up question to /gpt/chat. The server
+// remembers the most recent photo and answer, so this continues that
+// conversation. Uses its own HTTP call (30 s timeout + getString) rather than
+// makeRequest(), whose 5 s default timeout is too short for a Claude call.
+void chat()
+{
+  const char *q = strArgs[0];
+  Serial.print("chat question: ");
+  Serial.println(q);
+
+#ifdef SECURE
+  WiFiClientSecure client;
+  client.setInsecure();
+#else
+  WiFiClient client;
+#endif
+  HTTPClient http;
+  http.setTimeout(30000);
+  String url = String(SERVER) + "/gpt/chat?question=" + urlEncode(String(q));
+  http.begin(client, url.c_str());
+  int code = http.GET();
+  Serial.printf("GET /gpt/chat -> %d\n", code);
+
+  if (code != 200) {
+    http.end();
+    char e[40];
+    snprintf(e, sizeof(e), "chat http %d", code);
+    fullResponse = wrapForCalc(String(e));
+    PAGE_PAGE = 0;
+    sendPage();
+    return;
+  }
+  String body = http.getString();
+  http.end();
+
+  fullResponse = wrapForCalc(body);
+  PAGE_PAGE = 0;
+  sendPage();
+}
+
 void sendPage() {
+  int len = (int)fullResponse.length();
+
+  // Nothing paginated yet — the command failed, or no response arrived.
+  // Do NOT overwrite `message`: it still holds whatever setError() wrote,
+  // which is the only diagnostic the calculator can show the user.
+  if (len == 0) {
+    if (message[0] == '\0') {
+      strncpy(message, "NO RESPONSE", MAXSTRARGLEN);
+    }
+    Serial.print("sendPage: empty fullResponse, keeping message: ");
+    Serial.println(message);
+    setSuccess(message);
+    return;
+  }
+
+  // Clamp the page index instead of letting it run off the end. Requesting a
+  // page past the last one just re-sends the last page, so the calculator
+  // never has to detect "end of pages" via an empty string.
+  int maxPage = (len - 1) / PAGE_SIZE;
+  if (PAGE_PAGE < 0) PAGE_PAGE = 0;
+  if (PAGE_PAGE > maxPage) PAGE_PAGE = maxPage;
+
   int start = PAGE_PAGE * PAGE_SIZE;
-  String pageContent = fullResponse.substring(start, min(start + PAGE_SIZE, (int)fullResponse.length()));
-  
+  String pageContent = fullResponse.substring(start, min(start + PAGE_SIZE, len));
+
+  // A zero-length TI string variable makes the calculator throw
+  // ERR:INVALID DIM. Always send at least one character.
+  if (pageContent.length() == 0) pageContent = " ";
+
   strncpy(message, pageContent.c_str(), MAXSTRARGLEN);
+  message[MAXSTRARGLEN - 1] = '\0';
+  Serial.printf("sendPage: page %d/%d, %u chars\n",
+                PAGE_PAGE, maxPage, (unsigned)pageContent.length());
   setSuccess(message);
 }
 
@@ -862,15 +1081,30 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
     return -10;
   }
 
-  // Discard a few frames so auto-exposure converges — but do it FAST with no
-  // inter-frame delays. There's a hard tradeoff here: the AEC needs a handful
-  // of frames to settle, while the sensor's self-heating starts visibly
-  // degrading the image after roughly 5 seconds of streaming. 5 back-to-back
-  // frames at 10MHz XCLK lands around 1 second, which gets most of the AEC
-  // convergence while staying well inside the thermal budget.
-  for (int i = 0; i < 5; ++i) {
-    camera_fb_t *warmup = esp_camera_fb_get();
-    if (warmup) esp_camera_fb_return(warmup);
+  // Wait for autofocus to lock, draining frames meanwhile so auto-exposure
+  // converges in parallel. Continuous AF typically locks in 0.5-2 s.
+  // Timeout at 3 s so a failed lock still produces a (softer) picture.
+  {
+    unsigned long af_t0 = millis();
+    bool focused = false;
+    // Auto-exposure needs time to ramp up from a cold start, independently
+    // of focus. AF can lock in <1 s, so don't stop just because focus
+    // locked — keep draining frames until at least AE_SETTLE_MS has passed.
+    const unsigned long AE_SETTLE_MS = 1500;
+    while (millis() - af_t0 < 3000) {
+      camera_fb_t *w = esp_camera_fb_get();
+      if (w) esp_camera_fb_return(w);
+      if (af_ready && ti32_af.getFWStatus() == FW_STATUS_S_FOCUSED) {
+        focused = true;
+        if (millis() - af_t0 >= AE_SETTLE_MS) break;
+      }
+      if (!af_ready && millis() - af_t0 > 800) break;  // non-AF sensor
+    }
+    Serial.printf("focus %s after %lu ms\n",
+                  focused ? "LOCKED" : "not locked", millis() - af_t0);
+    // The buffered frame may predate the lock — throw one more away.
+    camera_fb_t *w = esp_camera_fb_get();
+    if (w) esp_camera_fb_return(w);
   }
 
   camera_fb_t *fb = esp_camera_fb_get();
@@ -1015,7 +1249,7 @@ void solve()
   }
 
   // Reuse the existing pager so long answers can be scrolled on the calculator.
-  fullResponse = String(response);
+  fullResponse = wrapForCalc(String(response));
   PAGE_PAGE = 0;
   sendPage();
 #else
