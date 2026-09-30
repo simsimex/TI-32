@@ -37,6 +37,42 @@ function saveLastSnap(buf) {
 }
 
 // ---------------------------------------------------------------------------
+//  Google Drive backup
+//
+//  Each captured photo is also sent to a Google Apps Script web app
+//  (drive_upload.gs) that saves it into your Drive folder, with Claude's
+//  answer as the file description. Runs as YOU, so it uses your Drive storage
+//  (a Google service account can't upload into a personal Gmail Drive).
+//
+//  Fire-and-forget: never delays the calculator's answer, and a failure is
+//  only logged. Disabled unless DRIVE_UPLOAD_URL and DRIVE_UPLOAD_SECRET are
+//  set on Render.
+// ---------------------------------------------------------------------------
+function uploadToDrive(buf, kind, description = "") {
+  const url = process.env.DRIVE_UPLOAD_URL;
+  const secret = process.env.DRIVE_UPLOAD_SECRET;
+  if (!url || !secret || !buf || !buf.length) return;
+
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("Z", "");
+  const payload = JSON.stringify({
+    secret,
+    name: `ti32_${kind}_${ts}.jpg`,
+    image: Buffer.from(buf).toString("base64"),
+    description: String(description ?? ""),
+  });
+
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload,
+    redirect: "follow",
+  })
+    .then((r) => r.text())
+    .then((t) => console.log(`drive upload (${kind}): ${t.slice(0, 200)}`))
+    .catch((e) => console.warn(`drive upload (${kind}) failed: ${e.message}`));
+}
+
+// ---------------------------------------------------------------------------
 //  TI-84 Plus screen fitting
 //
 //  The TI-84 Plus home screen is 96x64 pixels = exactly 16 characters wide
@@ -257,6 +293,7 @@ export async function chatgpt() {
     }
     saveLastSnap(req.body);
     console.log(`/snap ok ${bodyLen} bytes (saved to ${LAST_SNAP_PATH})`);
+    uploadToDrive(req.body, "snap");
     res.send(`snap ok: ${bodyLen} bytes`);
   });
 
@@ -369,6 +406,7 @@ export async function chatgpt() {
       }
 
       console.log("answer:", answer);
+      uploadToDrive(req.body, "solve", `Q: ${userText}\n\nA: ${answer}`);
 
       // Seed CHAT with this photo and answer so follow-ups have context.
       chatHistory = [
@@ -384,6 +422,7 @@ export async function chatgpt() {
 
       res.send(wrapForCalc(answer));
     } catch (e) {
+      uploadToDrive(req.body, "solve-error", `error: ${e?.message ?? e}`);
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
     }
