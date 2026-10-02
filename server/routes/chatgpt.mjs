@@ -39,7 +39,7 @@ function saveLastSnap(buf) {
 // ---------------------------------------------------------------------------
 //  Image orientation — set on Render, no code change or reflash needed.
 //
-//    IMAGE_ROTATE   0 | 90 | 180 | 270   (degrees clockwise)
+//    IMAGE_ROTATE   0 | 90 | 180 | 270   (degrees clockwise, default 90)
 //    IMAGE_FLIP_H   1 = mirror left/right
 //    IMAGE_FLIP_V   1 = mirror top/bottom
 //
@@ -47,7 +47,9 @@ function saveLastSnap(buf) {
 //  corrected image. With none set, the original bytes pass through untouched.
 // ---------------------------------------------------------------------------
 async function orientImage(buf) {
-  const rot = parseInt(process.env.IMAGE_ROTATE ?? "0", 10) || 0;
+  // Default 90 deg clockwise: the camera is mounted sideways in the calc.
+  // Override on Render with IMAGE_ROTATE (0 to disable, 270 for the other way).
+  const rot = parseInt(process.env.IMAGE_ROTATE ?? "90", 10) || 0;
   const flipH = process.env.IMAGE_FLIP_H === "1";
   const flipV = process.env.IMAGE_FLIP_V === "1";
   if (!rot && !flipH && !flipV) return buf;
