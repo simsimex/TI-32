@@ -37,6 +37,33 @@ function saveLastSnap(buf) {
 }
 
 // ---------------------------------------------------------------------------
+//  Image orientation — set on Render, no code change or reflash needed.
+//
+//    IMAGE_ROTATE   0 | 90 | 180 | 270   (degrees clockwise)
+//    IMAGE_FLIP_H   1 = mirror left/right
+//    IMAGE_FLIP_V   1 = mirror top/bottom
+//
+//  Applied once on arrival, so Claude, /gpt/last and Drive all get the same
+//  corrected image. With none set, the original bytes pass through untouched.
+// ---------------------------------------------------------------------------
+async function orientImage(buf) {
+  const rot = parseInt(process.env.IMAGE_ROTATE ?? "0", 10) || 0;
+  const flipH = process.env.IMAGE_FLIP_H === "1";
+  const flipV = process.env.IMAGE_FLIP_V === "1";
+  if (!rot && !flipH && !flipV) return buf;
+  try {
+    let img = sharp(buf);
+    if (rot) img = img.rotate(rot);
+    if (flipH) img = img.flop();    // horizontal mirror
+    if (flipV) img = img.flip();    // vertical mirror
+    return await img.jpeg({ quality: 92 }).toBuffer();
+  } catch (e) {
+    console.warn("orientImage failed, using original:", e.message);
+    return buf;
+  }
+}
+
+// ---------------------------------------------------------------------------
 //  Google Drive backup
 //
 //  Each captured photo is also sent to a Google Apps Script web app
@@ -300,9 +327,10 @@ export async function chatgpt() {
       res.status(400).send("no image body");
       return;
     }
-    saveLastSnap(req.body);
+    const img = await orientImage(req.body);
+    saveLastSnap(img);
     console.log(`/snap ok ${bodyLen} bytes (saved to ${LAST_SNAP_PATH})`);
-    uploadToDrive(req.body, "snap");
+    uploadToDrive(img, "snap");
     res.send(`snap ok: ${bodyLen} bytes`);
   });
 
@@ -357,8 +385,9 @@ export async function chatgpt() {
         ? `What is the answer to question ${questionNumber}?`
         : "What is the answer to this question?";
 
-      saveLastSnap(req.body);
-      const base64Image = Buffer.from(req.body).toString("base64");
+      const img = await orientImage(req.body);
+      saveLastSnap(img);
+      const base64Image = Buffer.from(img).toString("base64");
       console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length}`);
 
       let answer;
@@ -411,7 +440,7 @@ export async function chatgpt() {
       }
 
       console.log("answer:", answer);
-      uploadToDrive(req.body, "solve", `Q: ${userText}\n\nA: ${answer}`);
+      uploadToDrive(img, "solve", `Q: ${userText}\n\nA: ${answer}`);
 
       // Seed CHAT with this photo and answer so follow-ups have context.
       chatHistory = [
