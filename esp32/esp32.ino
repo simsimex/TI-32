@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.22-OV5640 (EXPLAIN option) ///
+//   TI-32 FIRMWARE v3.23-OV5640 (longer SOLVE/EXPLAIN) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -358,7 +358,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.22-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.23-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -1027,7 +1027,7 @@ void chat()
 void explain()
 {
   Serial.println("explain requested");
-  fetchToPager(String(SERVER) + "/gpt/explain", 45000);
+  fetchToPager(String(SERVER) + "/gpt/explain", 65000);
 }
 
 void sendPage() {
@@ -1191,7 +1191,7 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
 #endif
   HTTPClient http;
   http.setAuthorization(HTTP_USERNAME, HTTP_PASSWORD);
-  http.setTimeout(30000);  // vision calls take a while
+  http.setTimeout(60000);  // longer SOLVE answers + thinking take a while
 
   String url = String(SERVER) + route;
   Serial.println(url);

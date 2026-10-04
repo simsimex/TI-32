@@ -186,9 +186,9 @@ const SYSTEM_PROMPT_ASK =
 const SYSTEM_PROMPT_SOLVE =
   "You are a math/science tutor answering a question shown in a photo. " +
   "Your answer is displayed on a TI-84 calculator: 16 characters per line, " +
-  "6 lines visible at a time. Keep the whole reply under 90 characters if you " +
-  "possibly can. If the question is multiple choice, reply with just the letter. " +
-  "Otherwise give the final answer, plus at most one very short sentence of work. " +
+  "6 lines visible at a time, paged. Start with the final answer, then give the " +
+  "key working: the method and the main steps with numbers. Aim for 300-700 " +
+  "characters. If the question is multiple choice, start with the letter. " +
   "Plain ASCII only - no emojis, no markdown, no special symbols. " +
   "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
   "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
@@ -215,8 +215,9 @@ const SYSTEM_PROMPT_EXPLAIN =
   "identify what the problem is asking, state the method, and show each step " +
   "with the numbers, ending with the final answer. If the short answer was " +
   "wrong, say so and correct it. Your reply is read on a TI-84 calculator, " +
-  "16 characters per line, paged 6 lines at a time, so be thorough but " +
-  "economical: aim for 300-700 characters. Plain sentences, no markdown, no " +
+  "16 characters per line, paged 6 lines at a time. Be thorough: explain why " +
+  "each step works, not just what it is, and mention common mistakes to avoid. " +
+  "Aim for 800-1500 characters. Plain sentences, no markdown, no " +
   "bullet lists, no line breaks. " +
   "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
   "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
@@ -421,7 +422,7 @@ export async function chatgpt() {
         const client = await getAnthropic();
         const result = await client.messages.create({
           model: ANTHROPIC_MODEL,
-          max_tokens: 8000,
+          max_tokens: 16000,
           system: SYSTEM_PROMPT_SOLVE + STUDY_SYSTEM_NOTE,
           messages: withStudy([
             {
@@ -523,7 +524,7 @@ export async function chatgpt() {
       const ask = "Explain the full solution step by step.";
       const result = await client.messages.create({
         model: ANTHROPIC_MODEL,
-        max_tokens: 16000,
+        max_tokens: 32000,
         system: SYSTEM_PROMPT_EXPLAIN + STUDY_SYSTEM_NOTE,
         messages: withStudy([...chatHistory, { role: "user", content: ask }]),
       });
