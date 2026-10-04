@@ -21,6 +21,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import sharp from "sharp";
+import { loadStudy, withStudy, STUDY_SYSTEM_NOTE } from "./study.mjs";
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 
@@ -238,7 +239,8 @@ function textFrom(result) {
   const blocks = result?.content ?? [];
   const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join(" ").trim();
   console.log(`claude: stop=${result?.stop_reason} blocks=[${blocks.map((b) => b.type).join(",")}] ` +
-              `in=${result?.usage?.input_tokens} out=${result?.usage?.output_tokens}`);
+              `in=${result?.usage?.input_tokens} out=${result?.usage?.output_tokens} ` +
+              `cache_write=${result?.usage?.cache_creation_input_tokens ?? 0} cache_read=${result?.usage?.cache_read_input_tokens ?? 0}`);
   if (text) return text;
   return `No answer from Claude (stop reason: ${result?.stop_reason ?? "unknown"}).`;
 }
@@ -297,8 +299,8 @@ export async function chatgpt() {
         const result = await client.messages.create({
           model: ANTHROPIC_MODEL,
           max_tokens: 8000,
-          system: SYSTEM_PROMPT_ASK,
-          messages: [{ role: "user", content: String(question) }],
+          system: SYSTEM_PROMPT_ASK + STUDY_SYSTEM_NOTE,
+          messages: withStudy([{ role: "user", content: String(question) }]),
         });
         answer = textFrom(result);
       }
@@ -420,8 +422,8 @@ export async function chatgpt() {
         const result = await client.messages.create({
           model: ANTHROPIC_MODEL,
           max_tokens: 8000,
-          system: SYSTEM_PROMPT_SOLVE,
-          messages: [
+          system: SYSTEM_PROMPT_SOLVE + STUDY_SYSTEM_NOTE,
+          messages: withStudy([
             {
               role: "user",
               content: [
@@ -436,7 +438,7 @@ export async function chatgpt() {
                 { type: "text", text: userText },
               ],
             },
-          ],
+          ]),
         });
         answer = textFrom(result);
       }
@@ -485,8 +487,8 @@ export async function chatgpt() {
       const result = await client.messages.create({
         model: ANTHROPIC_MODEL,
         max_tokens: 8000,
-        system: hasPhoto ? SYSTEM_PROMPT_CHAT : SYSTEM_PROMPT_ASK,
-        messages,
+        system: (hasPhoto ? SYSTEM_PROMPT_CHAT : SYSTEM_PROMPT_ASK) + STUDY_SYSTEM_NOTE,
+        messages: withStudy(messages),
       });
       const answer = textFrom(result);
 
@@ -522,8 +524,8 @@ export async function chatgpt() {
       const result = await client.messages.create({
         model: ANTHROPIC_MODEL,
         max_tokens: 16000,
-        system: SYSTEM_PROMPT_EXPLAIN,
-        messages: [...chatHistory, { role: "user", content: ask }],
+        system: SYSTEM_PROMPT_EXPLAIN + STUDY_SYSTEM_NOTE,
+        messages: withStudy([...chatHistory, { role: "user", content: ask }]),
       });
       const answer = textFrom(result);
 
@@ -538,6 +540,19 @@ export async function chatgpt() {
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
     }
+  });
+
+  // --------------------------------------------------------------------------
+  // GET /gpt/study — what course material is loaded (open in a browser)
+  // --------------------------------------------------------------------------
+  routes.get("/study", (req, res) => {
+    const st = loadStudy();
+    res.json({
+      topic: st.topic,
+      folder: st.dir,
+      totalKB: Math.round(st.totalBytes / 1024),
+      files: st.files.map((f) => ({ name: f.name, KB: Math.round(f.size / 1024), ...(f.skipped ? { skipped: f.skipped } : {}) })),
+    });
   });
 
   return routes;
