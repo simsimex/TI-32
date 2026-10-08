@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.23-OV5640 (longer SOLVE/EXPLAIN) ///
+//   TI-32 FIRMWARE v3.25-OV5640 (UMD WIFI / HOTSPOT choice) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -85,6 +85,7 @@ const int PAGE_SIZE = 96;
 int PAGE_PAGE = 0; 
 
 void connect();
+void connectCampus();
 void disconnect();
 void gpt();
 void send();
@@ -132,13 +133,14 @@ struct Command commands[] = {
     { 17, "clearChat", 1, clearChat, true}, 
     { 18, "chat", 1, chat, true },        // follow-up question about the last photo
     { 19, "explain", 0, explain, true },  // full worked solution for the last photo
+    { 20, "connect_campus", 0, connectCampus, false },  // join umd-iot instead of the hotspot
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
 // Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
 // actually dispatched by loop(). The camera commands snap(7) and solve(8) are
 // already <= 14, but enabling everything keeps the launcher/UI features working.
-constexpr int MAXCOMMAND = 19;
+constexpr int MAXCOMMAND = 20;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -358,7 +360,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.23-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.25-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -729,10 +731,16 @@ int makeRequest(String url, char *result, int resultLen, size_t *len)
   return 0;
 }
 
-void connect()
+static void connectTo(const char *ssid, const char *pass);
+
+// CONNECT -> HOTSPOT (command 0)
+void connect() { connectTo(WIFI_SSID, WIFI_PASS); }
+
+// CONNECT -> UMD WIFI (command 20)
+void connectCampus() { connectTo(WIFI2_SSID, WIFI2_PASS); }
+
+static void connectTo(const char *ssid, const char *pass)
 {
-  const char *ssid = WIFI_SSID;
-  const char *pass = WIFI_PASS;
   Serial.print("SSID: ");
   Serial.println(ssid);
   Serial.print("PASS: ");
