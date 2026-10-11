@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.23-OV5640 (longer SOLVE/EXPLAIN) ///
+//   TI-32 FIRMWARE v3.26-OV5640 (campus WiFi diagnostics) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -85,6 +85,7 @@ const int PAGE_SIZE = 96;
 int PAGE_PAGE = 0; 
 
 void connect();
+void connectCampus();
 void disconnect();
 void gpt();
 void send();
@@ -132,13 +133,14 @@ struct Command commands[] = {
     { 17, "clearChat", 1, clearChat, true}, 
     { 18, "chat", 1, chat, true },        // follow-up question about the last photo
     { 19, "explain", 0, explain, true },  // full worked solution for the last photo
+    { 20, "connect_campus", 0, connectCampus, false },  // join umd-iot instead of the hotspot
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
 // Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
 // actually dispatched by loop(). The camera commands snap(7) and solve(8) are
 // already <= 14, but enabling everything keeps the launcher/UI features working.
-constexpr int MAXCOMMAND = 19;
+constexpr int MAXCOMMAND = 20;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -358,7 +360,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.23-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.26-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -729,10 +731,53 @@ int makeRequest(String url, char *result, int resultLen, size_t *len)
   return 0;
 }
 
-void connect()
+static void connectTo(const char *ssid, const char *pass);
+
+// Why the last connection attempt failed, straight from the WiFi driver.
+static volatile int  wifi_last_reason = 0;
+static volatile bool wifi_associated  = false;   // joined the AP (before DHCP)
+static bool wifi_events_hooked = false;
+
+static void hookWifiEvents()
 {
-  const char *ssid = WIFI_SSID;
-  const char *pass = WIFI_PASS;
+  if (wifi_events_hooked) return;
+  wifi_events_hooked = true;
+  WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info) {
+    if (e == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+      wifi_associated = true;
+      Serial.println("[wifi] associated with AP, waiting for IP...");
+    } else if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      wifi_associated = false;
+      wifi_last_reason = info.wifi_sta_disconnected.reason;
+      Serial.printf("[wifi] disconnected, reason %d\n", wifi_last_reason);
+    } else if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.println("[wifi] got IP");
+    }
+  });
+}
+
+// Plain-English version of the driver's reason code, for the calculator.
+static const char *wifiReasonText(int r)
+{
+  switch (r) {
+    case 2: case 15: case 204: return "WRONG PASSWORD?";
+    case 201: return "NETWORK NOT FOUND";
+    case 202: return "AUTH REJECTED";
+    case 203: return "AP REFUSED JOIN";
+    case 210: case 211: return "SECURITY MISMATCH";
+    case 212: return "SIGNAL TOO WEAK";
+    default:  return "WIFI FAIL";
+  }
+}
+
+// CONNECT -> HOTSPOT (command 0)
+void connect() { connectTo(WIFI_SSID, WIFI_PASS); }
+
+// CONNECT -> UMD WIFI (command 20)
+void connectCampus() { connectTo(WIFI2_SSID, WIFI2_PASS); }
+
+static void connectTo(const char *ssid, const char *pass)
+{
   Serial.print("SSID: ");
   Serial.println(ssid);
   Serial.print("PASS: ");
@@ -748,22 +793,35 @@ void connect()
     // them — let begin() handle the transition. If the chip was on a
     // different network with the same name, begin will roam; if on a
     // different SSID, the timeout below catches it.
+    hookWifiEvents();
+    wifi_last_reason = 0;
+    wifi_associated = false;
+    // Campus networks have many access points with the same name. The
+    // default "fast scan" joins the FIRST one it hears, often a weak, far
+    // one. Scan every channel and join the strongest instead.
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
     WiFi.begin(ssid, pass);
   }
 
-  // Wait up to 15 seconds for a real connection. Don't busy-spin forever.
+  // Campus WiFi (full scan + slower DHCP) needs longer than a hotspot.
+  // The calculator waits 30 s, so give up at 25 s.
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
-    if (millis() - start > 15000)
+    if (millis() - start > 25000)
     {
-      Serial.println("connect timeout");
-      setError("connect timeout");
-      return;
-    }
-    if (WiFi.status() == WL_CONNECT_FAILED)
-    {
-      setError("failed to connect");
+      if (wifi_associated)
+        snprintf(message, MAXSTRARGLEN, "JOINED BUT NO IP (DHCP) TRY AGAIN");
+      else if (wifi_last_reason)
+        snprintf(message, MAXSTRARGLEN, "%s REASON %d", wifiReasonText(wifi_last_reason), wifi_last_reason);
+      else
+        snprintf(message, MAXSTRARGLEN, "CONNECT TIMEOUT");
+      Serial.println(message);
+      // Stop the background attempt so the next CONNECT starts clean and
+      // can't later report a half-working connection as "connected".
+      WiFi.disconnect(false);
+      setError(message);
       return;
     }
     delay(200);
@@ -781,7 +839,7 @@ void connect()
   Serial.println(WiFi.RSSI());
 
   // Surface the real SSID to the calculator too, so you can see it on screen.
-  snprintf(message, MAXSTRARGLEN, "connected: %s", WiFi.SSID().c_str());
+  snprintf(message, MAXSTRARGLEN, "CONNECTED %s SIGNAL %d", WiFi.SSID().c_str(), (int)WiFi.RSSI());
   setSuccess(message);
 }
 
@@ -999,10 +1057,16 @@ static void fetchToPager(const String &url, uint32_t timeoutMs)
   Serial.printf("GET %s -> %d\n", url.c_str(), code);
 
   if (code != 200) {
+    // Show the start of the error body too. A Render/Claude error reads
+    // like a sentence; an HTML page ("<html>...") means the CAMPUS network
+    // intercepted the request and it never reached Render.
+    String body = code > 0 ? http.getString() : String("");
     http.end();
-    char e[40];
-    snprintf(e, sizeof(e), "server error %d", code);
-    fullResponse = wrapForCalc(String(e));
+    Serial.printf("error body: %s\n", body.substring(0, 300).c_str());
+    body.replace("\n", " ");
+    String e = (code < 0) ? "NO SERVER ERR " + String(-code)
+                          : "SERVER ERROR " + String(code) + " " + body.substring(0, 140);
+    fullResponse = wrapForCalc(e);
   } else {
     String body = http.getString();
     http.end();
