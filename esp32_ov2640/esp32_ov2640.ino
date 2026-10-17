@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.26-OV2640 (OV2640 build, no autofocus) ///
+//   TI-32 FIRMWARE v3.27-OV2640 (OV2640 build, answer history) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -19,6 +19,7 @@
 #include <HTTPClient.h>
 #include <UrlEncode.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 
 // ---- Camera enabled for XIAO ESP32-S3 Sense ----
 #define CAMERA
@@ -81,6 +82,10 @@ int PAGE_PAGE = 0;
 
 void connect();
 void connectCampus();
+void clearHistory();
+static void histBegin();
+static void saveHistory(const String &title);
+static void loadHistory(int n);
 void disconnect();
 void gpt();
 void send();
@@ -129,13 +134,14 @@ struct Command commands[] = {
     { 18, "chat", 1, chat, true },        // follow-up question about the last photo
     { 19, "explain", 0, explain, true },  // full worked solution for the last photo
     { 20, "connect_campus", 0, connectCampus, false },  // join umd-iot instead of the hotspot
+    { 21, "clear_history", 0, clearHistory, false },    // wipe saved answers
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
 // Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
 // actually dispatched by loop(). The camera commands snap(7) and solve(8) are
 // already <= 14, but enabling everything keeps the launcher/UI features working.
-constexpr int MAXCOMMAND = 20;
+constexpr int MAXCOMMAND = 21;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -314,7 +320,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.26-OV2640 /// ===");
+  Serial.println("=== TI-32 v3.27-OV2640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -342,6 +348,7 @@ void setup()
   Serial.println(reboots);
   prefs.putUInt("boots", reboots + 1);
   prefs.end();
+  histBegin();
   // (WiFi mode init moved below — must run AFTER esp_camera_init or the
   // camera fails to allocate its frame buffer.)
 
@@ -483,6 +490,16 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen)
     }
     
   }
+  if (varName == 'H') {
+    if (type != VarTypes82::VarReal) {
+      return -1;
+    }
+    int n = TIVar::realToLong8x(data, model);
+    Serial.printf("history entry %d requested\n", n);
+    loadHistory(n);
+    return 0;
+  }
+
       if (varName == 'V') {
     if (type != VarTypes82::VarReal) {
       return -1;
@@ -683,6 +700,97 @@ int makeRequest(String url, char *result, int resultLen, size_t *len)
   http.end();
 
   return 0;
+}
+
+// ---- Answer history -----------------------------------------------------
+// The last HIST_MAX answers (SOLVE / EXPLAIN / CHAT) are saved to the chip's
+// flash (LittleFS, "spiffs" partition), so they survive power-off and Render
+// going to sleep. Files are /h<seq>.txt with a running sequence number kept in
+// Preferences; the newest is entry 1 on the calculator.
+//   Calculator: Send(H) with H = 1..HIST_MAX loads that entry into the pager.
+//   Command 21 clears everything.
+#define HIST_MAX 10
+static bool hist_ok = false;
+
+static String histPath(uint32_t seq) { return "/h" + String(seq) + ".txt"; }
+
+static uint32_t histNext()
+{
+  prefs.begin("hist", true);
+  uint32_t n = prefs.getUInt("next", 0);
+  prefs.end();
+  return n;
+}
+
+static void histBegin()
+{
+  hist_ok = LittleFS.begin(true);   // formats the partition on first use
+  Serial.printf("history storage %s\n", hist_ok ? "ready" : "FAILED");
+}
+
+// Save the answer currently in fullResponse. `title` is shown on the first row.
+static void saveHistory(const String &title)
+{
+  if (!hist_ok || !fullResponse.length()) return;
+  uint32_t seq = histNext();
+  File f = LittleFS.open(histPath(seq), "w");
+  if (!f) { Serial.println("history: write failed"); return; }
+  f.print(title);
+  f.print('\n');
+  f.print(fullResponse);
+  f.close();
+  if (seq >= HIST_MAX) LittleFS.remove(histPath(seq - HIST_MAX));  // drop the oldest
+  prefs.begin("hist", false);
+  prefs.putUInt("next", seq + 1);
+  prefs.end();
+  Serial.printf("history: saved #%u (%s)\n", (unsigned)seq, title.c_str());
+}
+
+static int histCount()
+{
+  if (!hist_ok) return 0;
+  uint32_t next = histNext();
+  int c = 0;
+  for (int i = 1; i <= HIST_MAX && (uint32_t)i <= next; i++)
+    if (LittleFS.exists(histPath(next - i))) c++;
+  return c;
+}
+
+// Load entry n (1 = newest) into the pager.
+static void loadHistory(int n)
+{
+  uint32_t next = histNext();
+  int count = histCount();
+  if (count == 0) {
+    fullResponse = wrapForCalc("NO HISTORY YET");
+  } else if (n < 1 || n > count) {
+    fullResponse = wrapForCalc("NO OLDER ANSWERS. PRESS UP FOR NEWER ONES.");
+  } else {
+    File f = LittleFS.open(histPath(next - n), "r");
+    if (!f) {
+      fullResponse = wrapForCalc("COULD NOT READ ENTRY");
+    } else {
+      String title = f.readStringUntil('\n');
+      String body = f.readString();
+      f.close();
+      fullResponse = wrapForCalc(String(n) + "/" + String(count) + " " + title) + body;
+    }
+  }
+  PAGE_PAGE = 0;
+}
+
+// Command 21
+void clearHistory()
+{
+  for (int i = 1; i <= HIST_MAX; i++) {
+    uint32_t next = histNext();
+    if ((uint32_t)i <= next) LittleFS.remove(histPath(next - i));
+  }
+  prefs.begin("hist", false);
+  prefs.putUInt("next", 0);
+  prefs.end();
+  Serial.println("history cleared");
+  setSuccess("HISTORY CLEARED");
 }
 
 static void connectTo(const char *ssid, const char *pass);
@@ -996,7 +1104,7 @@ String wrapForCalc(const String &in)
 // GET a server route and load the reply into the pager. Shared by CHAT and
 // EXPLAIN. Own HTTP call (30-45 s timeout + getString) rather than
 // makeRequest(), whose 5 s default is too short for a Claude call.
-static void fetchToPager(const String &url, uint32_t timeoutMs)
+static void fetchToPager(const String &url, uint32_t timeoutMs, const String &histTitle)
 {
 #ifdef SECURE
   WiFiClientSecure client;
@@ -1025,6 +1133,7 @@ static void fetchToPager(const String &url, uint32_t timeoutMs)
     String body = http.getString();
     http.end();
     fullResponse = wrapForCalc(body);
+    saveHistory(histTitle);
   }
   PAGE_PAGE = 0;
   sendPage();
@@ -1037,7 +1146,7 @@ void chat()
   const char *q = strArgs[0];
   Serial.print("chat question: ");
   Serial.println(q);
-  fetchToPager(String(SERVER) + "/gpt/chat?question=" + urlEncode(String(q)), 30000);
+  fetchToPager(String(SERVER) + "/gpt/chat?question=" + urlEncode(String(q)), 30000, "CHAT: " + String(q));
 }
 
 // EXPLAIN (command 19): full worked solution for the most recent photo.
@@ -1045,7 +1154,7 @@ void chat()
 void explain()
 {
   Serial.println("explain requested");
-  fetchToPager(String(SERVER) + "/gpt/explain", 65000);
+  fetchToPager(String(SERVER) + "/gpt/explain", 65000, "EXPLAIN");
 }
 
 void sendPage() {
@@ -1294,6 +1403,7 @@ void solve()
 
   // Reuse the existing pager so long answers can be scrolled on the calculator.
   fullResponse = wrapForCalc(String(response));
+  saveHistory("SOLVE");
   PAGE_PAGE = 0;
   sendPage();
 #else
