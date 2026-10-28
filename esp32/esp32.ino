@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.27-OV5640 (answer history) ///
+//   TI-32 FIRMWARE v3.28-OV5640 (history + mistake mode) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -88,6 +88,7 @@ int PAGE_PAGE = 0;
 void connect();
 void connectCampus();
 void clearHistory();
+void mistake();
 static void histBegin();
 static void saveHistory(const String &title);
 static void loadHistory(int n);
@@ -140,13 +141,14 @@ struct Command commands[] = {
     { 19, "explain", 0, explain, true },  // full worked solution for the last photo
     { 20, "connect_campus", 0, connectCampus, false },  // join umd-iot instead of the hotspot
     { 21, "clear_history", 0, clearHistory, false },    // wipe saved answers
+    { 22, "mistake", 1, mistake, true },  // research: solution w/ labeled error
 };
 
 constexpr int NUMCOMMANDS = sizeof(commands) / sizeof(struct Command);
 // Bumped from 14 -> 17 so commands sendPage(15), reply(16), clearChat(17) are
 // actually dispatched by loop(). The camera commands snap(7) and solve(8) are
 // already <= 14, but enabling everything keeps the launcher/UI features working.
-constexpr int MAXCOMMAND = 21;
+constexpr int MAXCOMMAND = 22;
 
 uint8_t header[MAXHDRLEN];
 uint8_t data[MAXDATALEN];
@@ -366,7 +368,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.27-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.28-OV5640 /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -1201,6 +1203,20 @@ void explain()
 {
   Serial.println("explain requested");
   fetchToPager(String(SERVER) + "/gpt/explain", 65000, "EXPLAIN");
+}
+
+// MISTAKE (command 22, 1 arg): research mode. Worked solution for the last
+// photo containing a typical student error, ending with a labeled ERROR KEY.
+// realArgs[0]: 1 = small computation error, 2 = partly wrong, 3 = mostly wrong.
+void mistake()
+{
+  int level = (int)realArgs[0];
+  if (level < 1 || level > 3) level = 1;
+  Serial.printf("mistake requested, level %d\n", level);
+  fullResponse = "";
+  const char *names[] = {"", "SMALL CALC ERR", "PARTLY WRONG", "MOSTLY WRONG"};
+  fetchToPager(String(SERVER) + "/gpt/mistake?level=" + String(level), 65000,
+               String("MISTAKE: ") + names[level]);
 }
 
 void sendPage() {

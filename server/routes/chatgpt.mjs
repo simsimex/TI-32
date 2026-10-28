@@ -209,6 +209,43 @@ const SYSTEM_PROMPT_CHAT =
   "symbol. Write ohm, pi, sqrt(), x^2, >=, and // for parallel resistors. " +
   "No bullet lists or line breaks - write in plain sentences.";
 
+// MISTAKE mode (research): generate a worked solution containing a realistic,
+// typical student error at a chosen severity, ALWAYS followed by a labeled
+// error key, so the samples can be studied and can't pass as a real answer.
+const MISTAKE_LEVELS = {
+  1: "SMALL COMPUTATION ERROR: use the correct method throughout, but make one " +
+     "small slip partway through (an arithmetic error, a dropped negative sign, " +
+     "a unit conversion slip, or a misread value) and carry it consistently to " +
+     "a wrong final answer.",
+  2: "PARTLY WRONG: set the problem up correctly, then make one realistic " +
+     "method error that students commonly make in this topic (wrong formula, " +
+     "misapplied rule, wrong sign convention, missing term) and carry it " +
+     "consistently to a wrong final answer.",
+  3: "MOSTLY WRONG: make a fundamental conceptual mistake near the start, the " +
+     "kind a student who misunderstands the core idea would make, and carry it " +
+     "consistently through to a wrong final answer.",
+};
+
+function mistakePrompt(level) {
+  return (
+    "You help an education research project that studies how students get " +
+    "problems wrong. The user photographed a problem (first message). Write a " +
+    "worked solution the way a real student would, containing exactly this " +
+    "kind of error: " + MISTAKE_LEVELS[level] + " The error must be one a real " +
+    "student plausibly makes, not random. Show each step with numbers. " +
+    "After the solution ALWAYS end with a section that begins with the exact " +
+    "words ERROR KEY: and states which step has the error, what the error is, " +
+    "the error category, and the correct final answer. Never omit the ERROR KEY. " +
+    "Your reply is read on a TI-84 calculator, 16 characters per line, paged " +
+    "6 lines at a time. Aim for 800-1500 characters for the solution plus a " +
+    "short ERROR KEY. Plain sentences, no markdown, no bullet lists, no line " +
+    "breaks. " +
+    "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
+    "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
+    "symbol. Write ohm, pi, sqrt(), x^2, >=, e^(-t/2), and // for parallel resistors."
+  );
+}
+
 const SYSTEM_PROMPT_EXPLAIN =
   "You are a math/science tutor. The user photographed a problem (first " +
   "message) and got a short answer. Now give a complete worked solution: " +
@@ -536,6 +573,37 @@ export async function chatgpt() {
       chatHistory = [...chatHistory.slice(0, 2), ...tail];
 
       console.log(`/explain -> ${answer.length} chars: ${answer}`);
+      res.send(wrapForCalc(answer));
+    } catch (e) {
+      console.error(e);
+      res.status(500).send(String(e?.message ?? e));
+    }
+  });
+
+  // GET /gpt/mistake?level=1|2|3  (1 small calc error, 2 partly wrong,
+  // 3 mostly wrong). Uses the most recent photo. Not added to chatHistory, so
+  // CHAT and EXPLAIN keep working from the correct answer.
+  routes.get("/mistake", async (req, res) => {
+    if (chatHistory.length === 0) {
+      res.send(wrapForCalc("Solve a problem first, then pick MISTAKE."));
+      return;
+    }
+    const level = [1, 2, 3].includes(+req.query.level) ? +req.query.level : 1;
+    try {
+      const client = await getAnthropic();
+      const ask = "Write the student-style solution with the error, then the ERROR KEY.";
+      const result = await client.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 32000,
+        system: mistakePrompt(level) + STUDY_SYSTEM_NOTE,
+        messages: withStudy([...chatHistory.slice(0, 2), { role: "user", content: ask }]),
+      });
+      let answer = textFrom(result);
+      // Guarantee the key is there even if the model forgets it.
+      if (!/ERROR KEY:/i.test(answer)) {
+        answer += " ERROR KEY: missing from this sample. Treat this solution as containing an intentional error.";
+      }
+      console.log(`/mistake level ${level} -> ${answer.length} chars: ${answer}`);
       res.send(wrapForCalc(answer));
     } catch (e) {
       console.error(e);
