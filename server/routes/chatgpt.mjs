@@ -226,7 +226,7 @@ const MISTAKE_LEVELS = {
      "consistently through to a wrong final answer.",
 };
 
-function mistakePrompt(level) {
+function mistakePrompt(level, length = "800-1500 characters for the solution plus a short ERROR KEY") {
   return (
     "You help an education research project that studies how students get " +
     "problems wrong. The user photographed a problem (first message). Write a " +
@@ -237,13 +237,33 @@ function mistakePrompt(level) {
     "words ERROR KEY: and states which step has the error, what the error is, " +
     "the error category, and the correct final answer. Never omit the ERROR KEY. " +
     "Your reply is read on a TI-84 calculator, 16 characters per line, paged " +
-    "6 lines at a time. Aim for 800-1500 characters for the solution plus a " +
-    "short ERROR KEY. Plain sentences, no markdown, no bullet lists, no line " +
+    "6 lines at a time. Aim for " + length + ". Plain sentences, no markdown, no bullet lists, no line " +
     "breaks. " +
     "CHARACTER RULES: the calculator can only show letters, digits, spaces and " +
     "these symbols: ! \" ' ( ) * + , - . / : < = > ? [ ] ^ . Never use any other " +
     "symbol. Write ohm, pi, sqrt(), x^2, >=, e^(-t/2), and // for parallel resistors."
   );
+}
+
+// Model for MISTAKE samples. The CHAT shortcut (1/2/3) must answer inside the
+// old firmware's 30 s CHAT timeout, so default to the faster Sonnet.
+// Override on Render with MISTAKE_MODEL.
+const MISTAKE_MODEL = process.env.MISTAKE_MODEL ?? "claude-sonnet-5-5";
+
+async function generateMistake(client, level, length) {
+  const ask = "Write the student-style solution with the error, then the ERROR KEY.";
+  const result = await client.messages.create({
+    model: MISTAKE_MODEL,
+    max_tokens: 16000,
+    system: mistakePrompt(level, length) + STUDY_SYSTEM_NOTE,
+    messages: withStudy([...chatHistory.slice(0, 2), { role: "user", content: ask }]),
+  });
+  let answer = textFrom(result);
+  // Guarantee the key is there even if the model forgets it.
+  if (!/ERROR KEY:/i.test(answer)) {
+    answer += " ERROR KEY: missing from this sample. Treat this solution as containing an intentional error.";
+  }
+  return answer;
 }
 
 const SYSTEM_PROMPT_EXPLAIN =
@@ -515,6 +535,34 @@ export async function chatgpt() {
       res.send(wrapForCalc("Type a question first."));
       return;
     }
+
+    // MISTAKE shortcut for firmware without the MISTAKE command: typing just
+    // 1, 2 or 3 in CHAT generates a research sample for the last photo.
+    const SHORTCUTS = {
+      "1": { level: 3, label: "MOSTLY WRONG: " },
+      "2": { level: 2, label: "PARTLY WRONG: " },
+      "3": { level: 1, label: "SMALL CALC ERR: " },
+    };
+    if (SHORTCUTS[question]) {
+      const { level, label } = SHORTCUTS[question];
+      if (chatHistory.length === 0) {
+        res.send(wrapForCalc("Solve a problem first, then send 1, 2 or 3 in CHAT."));
+        return;
+      }
+      try {
+        const client = await getAnthropic();
+        // Shorter than the full MISTAKE route so it fits CHAT's 30 s timeout.
+        const answer = label + await generateMistake(
+          client, level, "400-700 characters for the solution plus a one-sentence ERROR KEY");
+        console.log(`/chat shortcut ${question} -> ${answer.length} chars: ${answer}`);
+        res.send(wrapForCalc(answer));
+      } catch (e) {
+        console.error(e);
+        res.status(500).send(String(e?.message ?? e));
+      }
+      return;
+    }
+
     try {
       const client = await getAnthropic();
       const hasPhoto = chatHistory.length > 0;
@@ -591,18 +639,7 @@ export async function chatgpt() {
     const level = [1, 2, 3].includes(+req.query.level) ? +req.query.level : 1;
     try {
       const client = await getAnthropic();
-      const ask = "Write the student-style solution with the error, then the ERROR KEY.";
-      const result = await client.messages.create({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 32000,
-        system: mistakePrompt(level) + STUDY_SYSTEM_NOTE,
-        messages: withStudy([...chatHistory.slice(0, 2), { role: "user", content: ask }]),
-      });
-      let answer = textFrom(result);
-      // Guarantee the key is there even if the model forgets it.
-      if (!/ERROR KEY:/i.test(answer)) {
-        answer += " ERROR KEY: missing from this sample. Treat this solution as containing an intentional error.";
-      }
+      const answer = await generateMistake(client, level);
       console.log(`/mistake level ${level} -> ${answer.length} chars: ${answer}`);
       res.send(wrapForCalc(answer));
     } catch (e) {
