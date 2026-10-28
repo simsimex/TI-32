@@ -250,8 +250,11 @@ function mistakePrompt(level, length = "800-1500 characters for the solution plu
 // Override on Render with MISTAKE_MODEL.
 const MISTAKE_MODEL = process.env.MISTAKE_MODEL ?? "claude-sonnet-5-5";
 
-async function generateMistake(client, level, length) {
-  const ask = "Write the student-style solution with the error, then the ERROR KEY.";
+async function generateMistake(client, level, length, target) {
+  const ask = target
+    ? `Only do question ${target} from the photo (ignore the other questions). ` +
+      "Write the student-style solution with the error, then the ERROR KEY."
+    : "Write the student-style solution with the error, then the ERROR KEY.";
   const result = await client.messages.create({
     model: MISTAKE_MODEL,
     max_tokens: 16000,
@@ -543,17 +546,21 @@ export async function chatgpt() {
       "2": { level: 2, label: "PARTLY WRONG: " },
       "3": { level: 1, label: "SMALL CALC ERR: " },
     };
-    if (SHORTCUTS[question]) {
-      const { level, label } = SHORTCUTS[question];
+    // Accepts "1", "1 Q10A", "1 FOR Q10A", "2 for 9b", ...
+    const sc = question.match(/^([123])(?:\s+(?:FOR\s+)?(.+))?$/i);
+    if (sc) {
+      const { level, label: baseLabel } = SHORTCUTS[sc[1]];
+      const target = sc[2] ? sc[2].trim().toUpperCase() : "";
+      const label = target ? baseLabel.replace(": ", ` ${target}: `) : baseLabel;
       if (chatHistory.length === 0) {
-        res.send(wrapForCalc("Solve a problem first, then send 1, 2 or 3 in CHAT."));
+        res.send(wrapForCalc("Solve a problem first, then send 1, 2 or 3 (optionally + question, e.g. 1 Q10A) in CHAT."));
         return;
       }
       try {
         const client = await getAnthropic();
         // Shorter than the full MISTAKE route so it fits CHAT's 30 s timeout.
         const answer = label + await generateMistake(
-          client, level, "400-700 characters for the solution plus a one-sentence ERROR KEY");
+          client, level, "400-700 characters for the solution plus a one-sentence ERROR KEY", target);
         console.log(`/chat shortcut ${question} -> ${answer.length} chars: ${answer}`);
         res.send(wrapForCalc(answer));
       } catch (e) {
