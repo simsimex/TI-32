@@ -325,6 +325,26 @@ export async function chatgpt() {
   }
 
   async function getAnthropic() {
+    // TESTING SWITCH: while AI_PAUSED is true, no request goes to Claude (no
+    // API cost). Every route still runs normally (photo saved, rotated,
+    // uploaded to Drive, history kept) and the calculator gets a short
+    // "AI PAUSED" reply. Set AI_PAUSED back to false (or set AI_PAUSED=0 on
+    // Render) to turn Claude back on.
+    const AI_PAUSED = process.env.AI_PAUSED
+      ? process.env.AI_PAUSED !== "0"
+      : true; // <-- change to false when testing is done
+    if (AI_PAUSED) {
+      console.log("AI paused: skipping Claude call");
+      return {
+        messages: {
+          create: async () => ({
+            stop_reason: "ai_paused",
+            content: [{ type: "text", text: "AI PAUSED FOR TESTING. REQUEST REACHED THE SERVER OK." }],
+            usage: { input_tokens: 0, output_tokens: 0 },
+          }),
+        },
+      };
+    }
     if (_anthropic) return _anthropic;
     if (!process.env.ANTHROPIC_API_KEY) {
       throw new Error("ANTHROPIC_API_KEY is not set");
