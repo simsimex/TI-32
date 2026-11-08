@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.32-OV5640 (sensor zoom 1.6x, 180 flip, history + mistake) ///
+//   TI-32 FIRMWARE v3.33-OV5640 (doc exposure, single-shot AF, 2x zoom, 180 flip, history + mistake) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -291,12 +291,26 @@ void applySensorSettings()
   s->set_wb_mode(s, 0);             // auto
   s->set_exposure_ctrl(s, 1);
   s->set_gain_ctrl(s, 1);
-  s->set_brightness(s, 1);          // +1: modest lift for indoor light
-  s->set_contrast(s, 1);            // +1: a little punch for ink on paper
   s->set_saturation(s, 0);
-  s->set_sharpness(s, 1);
-  s->set_ae_level(s, 1);            // +1 exposure compensation
-  s->set_gainceiling(s, GAINCEILING_8X);  // more headroom in dim rooms
+  if (s->id.PID == 0x5640) {
+    // OV5640 tuned for reading pages. In this driver ae_level sets the
+    // auto-exposure TARGET: average brightness = (level+5)*10+5 out of 255.
+    // The old +1 aimed for 65, so a white page in a dark room came out grey.
+    // +4 aims for 95: about 45% brighter. Brightness stays 0 (it's only an
+    // offset that greys the black ink), contrast +2 and sharpening +2 for
+    // crisper text, and a 16x gain ceiling for dim rooms.
+    s->set_ae_level(s, 4);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 2);
+    s->set_sharpness(s, 2);
+    s->set_gainceiling(s, GAINCEILING_16X);
+  } else {
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    s->set_sharpness(s, 1);
+    s->set_ae_level(s, 1);
+    s->set_gainceiling(s, GAINCEILING_8X);
+  }
   s->set_lenc(s, 1);
   s->set_bpc(s, 1);
   s->set_wpc(s, 1);
@@ -324,7 +338,7 @@ void applySensorSettings()
 // wide and scale THAT to 1280x1024, so the middle of the scene fills the photo
 // at full sensor detail. 1.0 = no zoom (whole 120 deg view), 1.6 = default,
 // 2.0 = maximum (window 1280x1024 = native pixels, no scaling).
-#define CAM_ZOOM 1.6f
+#define CAM_ZOOM 2.0f   // 2.0 = sharpest (native pixels); 1.6 = wider view
 
 static void applySensorZoom(sensor_t *s)
 {
@@ -344,6 +358,25 @@ static void applySensorZoom(sensor_t *s)
                          1280, 1024, scale, false);
   Serial.printf("zoom %.1fx: sensor window %dx%d at (%d,%d) -> 1280x1024 %s\n",
                 z, ispW, ispH, startX, startY, r == 0 ? "ok" : "FAILED");
+}
+
+// One full autofocus scan (OV5640 AF firmware command 0x03). Continuous AF
+// reports "focused" whenever the lens is idle, even before it has searched,
+// so we take photos only after an explicit single scan finishes.
+// Keeps draining frames meanwhile so exposure keeps tracking.
+static bool singleAutoFocus(sensor_t *s, unsigned long timeoutMs)
+{
+  s->set_reg(s, 0x3023, 0xff, 0x01);   // ACK = busy
+  s->set_reg(s, 0x3022, 0xff, 0x03);   // CMD = trigger single auto focus
+  unsigned long t = millis();
+  while (millis() - t < timeoutMs) {
+    camera_fb_t *w = esp_camera_fb_get();
+    if (w) esp_camera_fb_return(w);
+    int ack = s->get_reg(s, 0x3023, 0xff);   // 0 = command finished
+    int st  = s->get_reg(s, 0x3029, 0xff);   // 0x10 = focused
+    if (ack == 0 && st == 0x10) return true;
+  }
+  return false;
 }
 
 // Power up the sensor and apply settings. Returns true on success.
@@ -401,7 +434,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.32-OV5640 (zoom) /// ===");
+  Serial.println("=== TI-32 v3.33-OV5640 (doc tuning) /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.
@@ -1343,28 +1376,22 @@ int captureAndPost(const String &route, char *result, int resultLen, size_t *out
     return -10;
   }
 
-  // Wait for autofocus to lock, draining frames meanwhile so auto-exposure
-  // converges in parallel. Continuous AF typically locks in 0.5-2 s.
-  // Timeout at 3 s so a failed lock still produces a (softer) picture.
+  // 1) Let auto-exposure and white balance settle from the cold start.
+  // 2) Run ONE full autofocus scan on the settled image, then capture.
   {
-    unsigned long af_t0 = millis();
-    bool focused = false;
-    // Auto-exposure needs time to ramp up from a cold start, independently
-    // of focus. AF can lock in <1 s, so don't stop just because focus
-    // locked — keep draining frames until at least AE_SETTLE_MS has passed.
-    const unsigned long AE_SETTLE_MS = 1500;
-    while (millis() - af_t0 < 3000) {
+    const unsigned long AE_SETTLE_MS = 2000;
+    unsigned long t_ae = millis();
+    while (millis() - t_ae < AE_SETTLE_MS) {
       camera_fb_t *w = esp_camera_fb_get();
       if (w) esp_camera_fb_return(w);
-      if (af_ready && ti32_af.getFWStatus() == FW_STATUS_S_FOCUSED) {
-        focused = true;
-        if (millis() - af_t0 >= AE_SETTLE_MS) break;
-      }
-      if (!af_ready && millis() - af_t0 > 800) break;  // non-AF sensor
     }
-    Serial.printf("focus %s after %lu ms\n",
-                  focused ? "LOCKED" : "not locked", millis() - af_t0);
-    // The buffered frame may predate the lock — throw one more away.
+    bool focused = false;
+    unsigned long t_af = millis();
+    if (af_ready) focused = singleAutoFocus(esp_camera_sensor_get(), 2500);
+    Serial.printf("exposure settled %lu ms, focus %s after %lu ms\n",
+                  AE_SETTLE_MS, af_ready ? (focused ? "LOCKED" : "NOT locked (timeout)") : "n/a",
+                  millis() - t_af);
+    // The buffered frame may predate the lock: throw one more away.
     camera_fb_t *w = esp_camera_fb_get();
     if (w) esp_camera_fb_return(w);
   }

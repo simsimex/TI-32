@@ -354,7 +354,7 @@ export async function chatgpt() {
     // Render) to turn Claude back on.
     const AI_PAUSED = process.env.AI_PAUSED
       ? process.env.AI_PAUSED !== "0"
-      : true; // <-- change to false when testing is done
+      : false; // <-- set to true to pause Claude again for testing
     if (AI_PAUSED) {
       console.log("AI paused: skipping Claude call");
       return {
