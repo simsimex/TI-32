@@ -1,5 +1,5 @@
 // =============================================================================
-//   TI-32 FIRMWARE v3.28-OV5640 (history + mistake mode) ///
+//   TI-32 FIRMWARE v3.32-OV5640 (sensor zoom 1.6x, 180 flip, history + mistake) ///
 //   - Camera enabled (XIAO ESP32-S3 Sense, OV2640)
 //   - Wired D0=TIP, D2=RING (video-2 layout)
 //   - Forces clean WiFi reconnect, prints actual SSID, 15s timeout
@@ -253,8 +253,10 @@ void buildCameraConfig()
   // examples are tuned for. (Heat is handled by cold-capture plus the
   // 0x302C output-drive fix in cameraPowerUp, not by underclocking.)
   ti32_cam_config.xclk_freq_hz = 20000000;
-  // SXGA (1280x1024). Seeed's official OV5640 AF examples run AF at SXGA,
-  // so capturing at the same size means no framesize switch after focusing.
+  // SXGA (1280x1024) output. The 120 deg lens is too wide for reading a page,
+  // so cameraPowerUp() then narrows the sensor's read window to the centre
+  // of the 5 MP sensor (CAM_ZOOM): a true zoom using the sensor's own pixels,
+  // with the same speed and brightness as a normal SXGA shot.
   ti32_cam_config.frame_size = FRAMESIZE_SXGA;
   ti32_cam_config.pixel_format = PIXFORMAT_JPEG;
   ti32_cam_config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -280,8 +282,10 @@ void applySensorSettings()
   // contrast crushes shadows, and max brightness + max exposure comp washes
   // out white paper. The real problem was focus, not tuning.
   s->set_special_effect(s, 0);      // 0 = normal colour (2 = grayscale)
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 0);
+  // Flipped on BOTH axes (= rotated 180 deg) vs v3.28, which came out upside
+  // down with the new 120 deg OV5640 module.
+  s->set_vflip(s, 0);
+  s->set_hmirror(s, 1);
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
   s->set_wb_mode(s, 0);             // auto
@@ -314,6 +318,34 @@ void applySensorSettings()
   // Serial.printf("0x3031 = 0x%02X\n", s->get_reg(s, 0x3031, 0xFF));
 }
 
+// ---- Firmware zoom (OV5640 only) -----------------------------------------
+// The OV5640's sensor is ~2624x1952 pixels. Normally the whole area is read
+// and shrunk to 1280x1024. Instead, read only a centred window 1/CAM_ZOOM as
+// wide and scale THAT to 1280x1024, so the middle of the scene fills the photo
+// at full sensor detail. 1.0 = no zoom (whole 120 deg view), 1.6 = default,
+// 2.0 = maximum (window 1280x1024 = native pixels, no scaling).
+#define CAM_ZOOM 1.6f
+
+static void applySensorZoom(sensor_t *s)
+{
+  if (!s || s->id.PID != 0x5640 || CAM_ZOOM <= 1.0f) return;
+  float z = CAM_ZOOM > 2.0f ? 2.0f : CAM_ZOOM;
+  // ISP window (what gets scaled to the output), 5:4 like SXGA, even sizes.
+  int ispW = ((int)(2560.0f / z)) & ~7;
+  int ispH = ((ispW * 4) / 5) & ~7;
+  const int offX = 32, offY = 16;               // same margins the driver uses
+  int rawW = ispW + 2 * offX, rawH = ispH + 2 * offY;
+  int startX = ((2624 - rawW) / 2) & ~1;        // centred, even (Bayer-safe)
+  int startY = ((1952 - rawH) / 2) & ~1;
+  int endX = startX + rawW - 1, endY = startY + rawH - 1;
+  bool scale = !(ispW == 1280 && ispH == 1024);
+  int r = s->set_res_raw(s, startX, startY, endX, endY, offX, offY,
+                         2844, 1968,           // frame timing: unchanged
+                         1280, 1024, scale, false);
+  Serial.printf("zoom %.1fx: sensor window %dx%d at (%d,%d) -> 1280x1024 %s\n",
+                z, ispW, ispH, startX, startY, r == 0 ? "ok" : "FAILED");
+}
+
 // Power up the sensor and apply settings. Returns true on success.
 bool cameraPowerUp()
 {
@@ -339,6 +371,7 @@ bool cameraPowerUp()
   }
 
   applySensorSettings();
+  applySensorZoom(s);
 
   if (is_ov5640) {
     // Upload the AF firmware (~4 KB over SCCB) and start continuous AF.
@@ -368,7 +401,7 @@ void setup()
   Serial.begin(115200);
   Serial.println("delay");
   delay(2000);
-  Serial.println("=== TI-32 v3.28-OV5640 /// ===");
+  Serial.println("=== TI-32 v3.32-OV5640 (zoom) /// ===");
 
   // Explicitly bring up PSRAM. This should already be on via the Tools
   // menu setting (PSRAM = OPI PSRAM), but if it isn't, this is our fallback.

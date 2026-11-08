@@ -43,23 +43,45 @@ function saveLastSnap(buf) {
 //    IMAGE_ROTATE   0 | 90 | 180 | 270   (degrees clockwise, default 270)
 //    IMAGE_FLIP_H   1 = mirror left/right
 //    IMAGE_FLIP_V   1 = mirror top/bottom
+//    IMAGE_ZOOM     extra centre crop for >=2000px photos (default 1 = off; zoom now happens in the camera firmware)
 //
 //  Applied once on arrival, so Claude, /gpt/last and Drive all get the same
 //  corrected image. With none set, the original bytes pass through untouched.
 // ---------------------------------------------------------------------------
 async function orientImage(buf) {
-  // Default 90 deg clockwise: the camera is mounted sideways in the calc.
+  // Default 270 deg clockwise: the camera is mounted sideways in the calc.
   // Override on Render with IMAGE_ROTATE (0 to disable, 90 for the other way).
   const rot = parseInt(process.env.IMAGE_ROTATE ?? "270", 10) || 0;
   const flipH = process.env.IMAGE_FLIP_H === "1";
   const flipV = process.env.IMAGE_FLIP_V === "1";
-  if (!rot && !flipH && !flipV) return buf;
+  // Digital zoom for the 5 MP wide-angle camera: keep the centre 1/ZOOM of
+  // the frame. Only applied to high-res photos (long edge >= IMAGE_ZOOM_MIN,
+  // default 2000 px) so lower-res calculators (e.g. TWO at 1280x1024) are
+  // never cropped. 1.6 turns 2560x1920 into 1600x1200, about the largest
+  // image Claude reads without shrinking it.
+  const zoom = parseFloat(process.env.IMAGE_ZOOM ?? "1") || 1;
+  const zoomMin = parseInt(process.env.IMAGE_ZOOM_MIN ?? "2000", 10) || 2000;
   try {
-    let img = sharp(buf);
-    if (rot) img = img.rotate(rot);
-    if (flipH) img = img.flop();    // horizontal mirror
-    if (flipV) img = img.flip();    // vertical mirror
-    return await img.jpeg({ quality: 92 }).toBuffer();
+    let out = buf;
+    if (rot || flipH || flipV) {
+      let img = sharp(buf);
+      if (rot) img = img.rotate(rot);
+      if (flipH) img = img.flop();    // horizontal mirror
+      if (flipV) img = img.flip();    // vertical mirror
+      out = await img.jpeg({ quality: 92 }).toBuffer();
+    }
+    if (zoom > 1) {
+      const { width, height } = await sharp(out).metadata();
+      if (Math.max(width, height) >= zoomMin) {
+        const w = Math.round(width / zoom);
+        const h = Math.round(height / zoom);
+        const left = Math.round((width - w) / 2);
+        const top = Math.round((height - h) / 2);
+        out = await sharp(out).extract({ left, top, width: w, height: h }).jpeg({ quality: 92 }).toBuffer();
+        console.log(`zoom ${zoom}x: ${width}x${height} -> ${w}x${h}`);
+      }
+    }
+    return out;
   } catch (e) {
     console.warn("orientImage failed, using original:", e.message);
     return buf;
