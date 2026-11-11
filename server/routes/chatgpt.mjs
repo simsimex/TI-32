@@ -25,6 +25,33 @@ import { loadStudy, withStudy, STUDY_SYSTEM_NOTE } from "./study.mjs";
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 
+// ---- Kimi (Moonshot AI) as a second SOLVE option ----------------------------
+// Kimi offers an Anthropic-compatible endpoint, so the same request format
+// (system prompt + photo + text) works with only a different base URL and key.
+// Set KIMI_API_KEY on Render. Optional: KIMI_MODEL, KIMI_EFFORT, KIMI_BASE_URL.
+//   KIMI_MODEL   kimi-k3.1-pro-highspeed (default, fastest) | kimi-k3.1-pro | kimi-k3
+//   KIMI_EFFORT  low (default, fastest) | high | max  (how long Kimi reasons)
+const KIMI_MODEL = process.env.KIMI_MODEL ?? "kimi-k3.1-pro-highspeed";
+const KIMI_EFFORT = process.env.KIMI_EFFORT ?? "low";
+const KIMI_BASE_URL = process.env.KIMI_BASE_URL ?? "https://api.moonshot.ai/anthropic";
+
+// Kimi's Anthropic-compatible API takes text and image blocks but not PDF
+// "document" blocks, and ignores cache_control inside messages. Swap any PDF
+// study files for a short note and drop the cache markers.
+function forKimi(messages) {
+  return messages.map((m) => {
+    if (typeof m.content === "string") return m;
+    const content = m.content.map((b) => {
+      if (b.type === "document") {
+        return { type: "text", text: "[A PDF study file is attached for Claude but cannot be read by Kimi.]" };
+      }
+      const { cache_control, ...rest } = b;
+      return rest;
+    });
+    return { ...m, content };
+  });
+}
+
 // Save the most recent uploaded frame (original and enhanced) for debugging.
 const LAST_SNAP_PATH = path.join(process.cwd(), "last_snap.jpg");
 const LAST_ENHANCED_PATH = path.join(process.cwd(), "last_enhanced.jpg");
@@ -309,6 +336,38 @@ const SYSTEM_PROMPT_EXPLAIN =
 // follow-ups always refer to the most recent question. Lives in process
 // memory only (clears on a Render restart — fine for this use).
 let chatHistory = [];          // Anthropic messages array
+
+// ---- Latest answer, kept on the server --------------------------------------
+// If the calculator times out, Claude is usually still working and the answer
+// arrives on the server a bit later. The calculator's CHECK SERVER button
+// (CHAT with the word LATEST) fetches it from here. Shared by all calculators.
+let latest = { kind: "", text: "", at: 0 };
+let job = null;                // { kind, at } while a request is in progress
+
+function startJob(kind) { job = { kind, at: Date.now() }; }
+function remember(kind, text) {
+  latest = { kind, text, at: Date.now() };
+  if (job && job.kind === kind) job = null;
+}
+function jobFailed(kind, e) {
+  remember(kind, `ERROR: ${e?.message ?? e}`);
+}
+function agoText(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s} SEC AGO`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m} MIN AGO` : `${Math.round(m / 60)} HR AGO`;
+}
+function latestReport() {
+  if (job && job.at >= latest.at) {
+    return `STILL WORKING ON ${job.kind}, STARTED ${agoText(Date.now() - job.at)}. ` +
+           "CHECK AGAIN IN 15 SEC.";
+  }
+  if (!latest.text) {
+    return "NO ANSWER ON THE SERVER YET. (IT RESETS WHEN THE SERVER RESTARTS.)";
+  }
+  return `LATEST ${latest.kind}, ${agoText(Date.now() - latest.at)}: ${latest.text}`;
+}
 const CHAT_MAX_TURNS = 6;      // follow-up exchanges kept after the photo turn
 
 const USE_OPENAI_ASK = process.env.USE_OPENAI === "1" || process.env.USE_OPENAI_FOR_ASK === "1";
@@ -344,6 +403,40 @@ export async function chatgpt() {
     const openai = await import("openai");
     _openai = new openai.default.OpenAI();
     return _openai;
+  }
+
+  let _kimi = null;
+  function aiPaused() {
+    return process.env.AI_PAUSED ? process.env.AI_PAUSED !== "0" : false;
+  }
+  const PAUSED_CLIENT = {
+    messages: {
+      create: async () => ({
+        stop_reason: "ai_paused",
+        content: [{ type: "text", text: "AI PAUSED FOR TESTING. REQUEST REACHED THE SERVER OK." }],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }),
+    },
+  };
+
+  async function getKimi() {
+    if (aiPaused()) {
+      console.log("AI paused: skipping Kimi call");
+      return PAUSED_CLIENT;
+    }
+    if (_kimi) return _kimi;
+    if (!process.env.KIMI_API_KEY) {
+      throw new Error("KIMI_API_KEY is not set on Render");
+    }
+    const Anthropic = await import("@anthropic-ai/sdk");
+    // Kimi's docs use "Authorization: Bearer"; the SDK sends x-api-key.
+    // Send both so either works.
+    _kimi = new Anthropic.default({
+      apiKey: process.env.KIMI_API_KEY,
+      baseURL: KIMI_BASE_URL,
+      defaultHeaders: { Authorization: `Bearer ${process.env.KIMI_API_KEY}` },
+    });
+    return _kimi;
   }
 
   async function getAnthropic() {
@@ -487,7 +580,16 @@ export async function chatgpt() {
         return;
       }
 
-      const questionNumber = req.query.n;
+      // Which AI answers: the calculator picks CLAUDE or KIMI in the SOLVE
+      // menu. Existing firmware can only send a question number, so KIMI is
+      // sent as n = 1000 + question number (1000 = Kimi, no number). ?ai=kimi
+      // also works.
+      let n = parseInt(req.query.n ?? "0", 10) || 0;
+      let provider = String(req.query.ai ?? "").toLowerCase() === "kimi" ? "kimi" : "claude";
+      if (n >= 1000) { provider = "kimi"; n -= 1000; }
+      const questionNumber = n > 0 ? n : null;
+      const jobName = provider === "kimi" ? "SOLVE (KIMI)" : "SOLVE";
+      startJob(jobName);
       const userText = questionNumber
         ? `What is the answer to question ${questionNumber}?`
         : "What is the answer to this question?";
@@ -498,7 +600,26 @@ export async function chatgpt() {
       console.log(`/solve got ${req.body.length} bytes, base64=${base64Image.length}`);
 
       let answer;
-      if (USE_OPENAI_SOLVE) {
+      if (provider === "kimi") {
+        const kimi = await getKimi();
+        const result = await kimi.messages.create({
+          model: KIMI_MODEL,
+          max_tokens: 16000,
+          output_config: { effort: KIMI_EFFORT },
+          system: SYSTEM_PROMPT_SOLVE + STUDY_SYSTEM_NOTE,
+          messages: forKimi(withStudy([
+            {
+              role: "user",
+              content: [
+                { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64Image } },
+                { type: "text", text: userText },
+              ],
+            },
+          ])),
+        });
+        console.log(`kimi: model=${KIMI_MODEL} effort=${KIMI_EFFORT}`);
+        answer = textFrom(result);
+      } else if (USE_OPENAI_SOLVE) {
         const gpt = await getOpenAI();
         const result = await gpt.chat.completions.create({
           model: "gpt-4o",
@@ -547,7 +668,7 @@ export async function chatgpt() {
       }
 
       console.log("answer:", answer);
-      uploadToDrive(img, "solve", `Q: ${userText}\n\nA: ${answer}`);
+      uploadToDrive(img, provider === "kimi" ? "solve-kimi" : "solve", `AI: ${provider}\nQ: ${userText}\n\nA: ${answer}`);
 
       // Seed CHAT with this photo and answer so follow-ups have context.
       chatHistory = [
@@ -561,9 +682,13 @@ export async function chatgpt() {
         { role: "assistant", content: answer },
       ];
 
-      res.send(wrapForCalc(answer));
+      // Label Kimi answers on the calculator so you know which AI answered.
+      const shown = provider === "kimi" ? `KIMI: ${answer}` : answer;
+      remember(jobName, shown);
+      res.send(wrapForCalc(shown));
     } catch (e) {
       uploadToDrive(req.body, "solve-error", `error: ${e?.message ?? e}`);
+      jobFailed(job?.kind ?? "SOLVE", e);
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
     }
@@ -578,6 +703,15 @@ export async function chatgpt() {
     const question = String(req.query.question ?? "").trim();
     if (!question) {
       res.send(wrapForCalc("Type a question first."));
+      return;
+    }
+
+    // CHECK SERVER: "LATEST" returns the most recent answer the server
+    // finished (or says it's still working), without calling Claude.
+    if (/^LATEST$/i.test(question)) {
+      const report = latestReport();
+      console.log(`/chat LATEST -> ${report.slice(0, 120)}`);
+      res.send(wrapForCalc(report));
       return;
     }
 
@@ -598,20 +732,25 @@ export async function chatgpt() {
         res.send(wrapForCalc("Solve a problem first, then send 1, 2 or 3 (optionally + question, e.g. 1 Q10A) in CHAT."));
         return;
       }
+      const kind = label.replace(/:\s*$/, "");
+      startJob(kind);
       try {
         const client = await getAnthropic();
         // Shorter than the full MISTAKE route so it fits CHAT's 30 s timeout.
         const answer = label + await generateMistake(
           client, level, "400-700 characters for the solution plus a one-sentence ERROR KEY", target);
         console.log(`/chat shortcut ${question} -> ${answer.length} chars: ${answer}`);
+        remember(kind, answer);
         res.send(wrapForCalc(answer));
       } catch (e) {
+        jobFailed(kind, e);
         console.error(e);
         res.status(500).send(String(e?.message ?? e));
       }
       return;
     }
 
+    startJob("CHAT");
     try {
       const client = await getAnthropic();
       const hasPhoto = chatHistory.length > 0;
@@ -636,8 +775,10 @@ export async function chatgpt() {
       }
 
       console.log(`/chat q="${question}" -> ${answer}`);
+      remember("CHAT", answer);
       res.send(wrapForCalc(answer));
     } catch (e) {
+      jobFailed("CHAT", e);
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
     }
@@ -653,6 +794,7 @@ export async function chatgpt() {
       res.send(wrapForCalc("Solve a problem first, then pick EXPLAIN."));
       return;
     }
+    startJob("EXPLAIN");
     try {
       const client = await getAnthropic();
       const ask = "Explain the full solution step by step.";
@@ -670,8 +812,10 @@ export async function chatgpt() {
       chatHistory = [...chatHistory.slice(0, 2), ...tail];
 
       console.log(`/explain -> ${answer.length} chars: ${answer}`);
+      remember("EXPLAIN", answer);
       res.send(wrapForCalc(answer));
     } catch (e) {
+      jobFailed("EXPLAIN", e);
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
     }
@@ -686,12 +830,15 @@ export async function chatgpt() {
       return;
     }
     const level = [1, 2, 3].includes(+req.query.level) ? +req.query.level : 1;
+    startJob("MISTAKE");
     try {
       const client = await getAnthropic();
       const answer = await generateMistake(client, level);
       console.log(`/mistake level ${level} -> ${answer.length} chars: ${answer}`);
+      remember("MISTAKE", answer);
       res.send(wrapForCalc(answer));
     } catch (e) {
+      jobFailed("MISTAKE", e);
       console.error(e);
       res.status(500).send(String(e?.message ?? e));
     }
@@ -700,6 +847,11 @@ export async function chatgpt() {
   // --------------------------------------------------------------------------
   // GET /gpt/study — what course material is loaded (open in a browser)
   // --------------------------------------------------------------------------
+  // GET /gpt/latest: same as CHECK SERVER, readable in a browser.
+  routes.get("/latest", (req, res) => {
+    res.type("text/plain").send(latestReport());
+  });
+
   routes.get("/study", (req, res) => {
     const st = loadStudy();
     res.json({
