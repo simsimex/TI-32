@@ -29,9 +29,14 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 // Kimi offers an Anthropic-compatible endpoint, so the same request format
 // (system prompt + photo + text) works with only a different base URL and key.
 // Set KIMI_API_KEY on Render. Optional: KIMI_MODEL, KIMI_EFFORT, KIMI_BASE_URL.
-//   KIMI_MODEL   kimi-k3.1-pro-highspeed (default, fastest) | kimi-k3.1-pro | kimi-k3
+//   KIMI_MODEL   pin one model; otherwise the server tries KIMI_MODELS in order
+//                and keeps the first one this account is allowed to use
+//                (free-tier accounts can't use every model).
 //   KIMI_EFFORT  low (default, fastest) | high | max  (how long Kimi reasons)
-const KIMI_MODEL = process.env.KIMI_MODEL ?? "kimi-k3.1-pro-highspeed";
+const KIMI_MODELS = process.env.KIMI_MODEL
+  ? [process.env.KIMI_MODEL]
+  : ["kimi-k3", "kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"];
+let kimiModel = null;          // the model that worked, remembered after the first success
 const KIMI_EFFORT = process.env.KIMI_EFFORT ?? "low";
 const KIMI_BASE_URL = process.env.KIMI_BASE_URL ?? "https://api.moonshot.ai/anthropic";
 
@@ -50,6 +55,29 @@ function forKimi(messages) {
     });
     return { ...m, content };
   });
+}
+
+// Send a request to Kimi, trying each model in KIMI_MODELS until one is
+// allowed for this account ("Not found the model ... or Permission denied"
+// = 404). The model that works is remembered for later requests.
+async function kimiCreate(kimi, params) {
+  const order = kimiModel ? [kimiModel, ...KIMI_MODELS.filter((m) => m !== kimiModel)] : KIMI_MODELS;
+  let lastErr;
+  for (const model of order) {
+    try {
+      const result = await kimi.messages.create({ ...params, model });
+      if (kimiModel !== model) console.log(`kimi: using model ${model}`);
+      kimiModel = model;
+      return result;
+    } catch (e) {
+      const notAllowed = e?.status === 404 || /not found the model|permission denied/i.test(String(e?.message));
+      if (!notAllowed) throw e;
+      console.log(`kimi: model ${model} not available for this account, trying next`);
+      lastErr = e;
+    }
+  }
+  throw new Error(`No Kimi model available for this account (tried ${order.join(", ")}). ` +
+                  `Check the Kimi console for which models your plan allows. ${lastErr?.message ?? ""}`);
 }
 
 // Save the most recent uploaded frame (original and enhanced) for debugging.
@@ -602,8 +630,7 @@ export async function chatgpt() {
       let answer;
       if (provider === "kimi") {
         const kimi = await getKimi();
-        const result = await kimi.messages.create({
-          model: KIMI_MODEL,
+        const result = await kimiCreate(kimi, {
           max_tokens: 16000,
           output_config: { effort: KIMI_EFFORT },
           system: SYSTEM_PROMPT_SOLVE + STUDY_SYSTEM_NOTE,
@@ -617,7 +644,7 @@ export async function chatgpt() {
             },
           ])),
         });
-        console.log(`kimi: model=${KIMI_MODEL} effort=${KIMI_EFFORT}`);
+        console.log(`kimi: model=${kimiModel} effort=${KIMI_EFFORT}`);
         answer = textFrom(result);
       } else if (USE_OPENAI_SOLVE) {
         const gpt = await getOpenAI();
