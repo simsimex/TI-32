@@ -327,18 +327,27 @@ function mistakePrompt(level, length = "800-1500 characters for the solution plu
 // Override on Render with MISTAKE_MODEL.
 const MISTAKE_MODEL = process.env.MISTAKE_MODEL ?? "claude-sonnet-5-5";
 
-async function generateMistake(client, level, length, target) {
+async function generateMistake(client, level, length, target, kimiClient = null) {
   const ask = target
     ? `Only do question ${target} from the photo (ignore the other questions). ` +
       "Write the student-style solution with the error, then the ERROR KEY."
     : "Write the student-style solution with the error, then the ERROR KEY.";
-  const result = await client.messages.create({
-    model: MISTAKE_MODEL,
+  const params = {
     max_tokens: 16000,
     system: mistakePrompt(level, length) + STUDY_SYSTEM_NOTE,
     messages: withStudy([...chatHistory.slice(0, 2), { role: "user", content: ask }]),
-  });
-  let answer = textFrom(result);
+  };
+  let answer;
+  if (kimiClient) {
+    // The last SOLVE was answered by Kimi, so Kimi writes the sample too.
+    const result = await kimiCreate(kimiClient, {
+      ...params, output_config: { effort: KIMI_EFFORT }, messages: forKimi(params.messages),
+    });
+    answer = "KIMI: " + textFrom(result, "kimi");
+  } else {
+    const result = await client.messages.create({ ...params, model: MISTAKE_MODEL });
+    answer = textFrom(result);
+  }
   // Guarantee the key is there even if the model forgets it.
   if (!/ERROR KEY:/i.test(answer)) {
     answer += " ERROR KEY: missing from this sample. Treat this solution as containing an intentional error.";
@@ -364,6 +373,9 @@ const SYSTEM_PROMPT_EXPLAIN =
 // follow-ups always refer to the most recent question. Lives in process
 // memory only (clears on a Render restart — fine for this use).
 let chatHistory = [];          // Anthropic messages array
+// Which AI answered the most recent SOLVE ("claude" | "kimi"). EXPLAIN, CHAT
+// follow-ups and the 1/2/3 samples about that photo go to the same AI.
+let lastProvider = "claude";
 
 // ---- Latest answer, kept on the server --------------------------------------
 // If the calculator times out, Claude is usually still working and the answer
@@ -405,10 +417,10 @@ const USE_OPENAI_SOLVE = process.env.USE_OPENAI === "1" || process.env.USE_OPENA
 // answer (adaptive thinking) and that thinking counts against max_tokens, so
 // a too-small budget can yield thinking blocks and NO text. When that
 // happens, say why instead of a bare "no response".
-function textFrom(result) {
+function textFrom(result, who = "claude") {
   const blocks = result?.content ?? [];
   const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join(" ").trim();
-  console.log(`claude: stop=${result?.stop_reason} blocks=[${blocks.map((b) => b.type).join(",")}] ` +
+  console.log(`${who}: stop=${result?.stop_reason} blocks=[${blocks.map((b) => b.type).join(",")}] ` +
               `in=${result?.usage?.input_tokens} out=${result?.usage?.output_tokens} ` +
               `cache_write=${result?.usage?.cache_creation_input_tokens ?? 0} cache_read=${result?.usage?.cache_read_input_tokens ?? 0}`);
   if (text) return text;
@@ -496,6 +508,21 @@ export async function chatgpt() {
     _anthropic = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
     return _anthropic;
   }
+  // Send a follow-up about the last photo to whichever AI solved it.
+  // `messages` already include the study material. Returns { text, ai }.
+  async function followUp({ system, messages, max_tokens }) {
+    if (lastProvider === "kimi" && chatHistory.length) {
+      const kimi = await getKimi();
+      const result = await kimiCreate(kimi, {
+        max_tokens, system, output_config: { effort: KIMI_EFFORT }, messages: forKimi(messages),
+      });
+      return { text: textFrom(result, "kimi"), ai: "kimi" };
+    }
+    const client = await getAnthropic();
+    const result = await client.messages.create({ model: ANTHROPIC_MODEL, max_tokens, system, messages });
+    return { text: textFrom(result), ai: "claude" };
+  }
+
 
   // --------------------------------------------------------------------------
   // GET /gpt/ask — text question, plain answer
@@ -645,7 +672,7 @@ export async function chatgpt() {
           ])),
         });
         console.log(`kimi: model=${kimiModel} effort=${KIMI_EFFORT}`);
-        answer = textFrom(result);
+        answer = textFrom(result, "kimi");
       } else if (USE_OPENAI_SOLVE) {
         const gpt = await getOpenAI();
         const result = await gpt.chat.completions.create({
@@ -698,6 +725,7 @@ export async function chatgpt() {
       uploadToDrive(img, provider === "kimi" ? "solve-kimi" : "solve", `AI: ${provider}\nQ: ${userText}\n\nA: ${answer}`);
 
       // Seed CHAT with this photo and answer so follow-ups have context.
+      lastProvider = provider;
       chatHistory = [
         {
           role: "user",
@@ -764,8 +792,9 @@ export async function chatgpt() {
       try {
         const client = await getAnthropic();
         // Shorter than the full MISTAKE route so it fits CHAT's 30 s timeout.
+        const kimiClient = lastProvider === "kimi" ? await getKimi() : null;
         const answer = label + await generateMistake(
-          client, level, "400-700 characters for the solution plus a one-sentence ERROR KEY", target);
+          client, level, "400-700 characters for the solution plus a one-sentence ERROR KEY", target, kimiClient);
         console.log(`/chat shortcut ${question} -> ${answer.length} chars: ${answer}`);
         remember(kind, answer);
         res.send(wrapForCalc(answer));
@@ -779,19 +808,17 @@ export async function chatgpt() {
 
     startJob("CHAT");
     try {
-      const client = await getAnthropic();
       const hasPhoto = chatHistory.length > 0;
       const messages = hasPhoto
         ? [...chatHistory, { role: "user", content: question }]
         : [{ role: "user", content: question }];
 
-      const result = await client.messages.create({
-        model: ANTHROPIC_MODEL,
+      const { text: answer, ai } = await followUp({
         max_tokens: 8000,
         system: (hasPhoto ? SYSTEM_PROMPT_CHAT : SYSTEM_PROMPT_ASK) + STUDY_SYSTEM_NOTE,
         messages: withStudy(messages),
       });
-      const answer = textFrom(result);
+      const shown = ai === "kimi" ? `KIMI: ${answer}` : answer;
 
       if (hasPhoto) {
         chatHistory.push({ role: "user", content: question });
@@ -801,9 +828,9 @@ export async function chatgpt() {
         chatHistory = [...chatHistory.slice(0, 2), ...tail];
       }
 
-      console.log(`/chat q="${question}" -> ${answer}`);
-      remember("CHAT", answer);
-      res.send(wrapForCalc(answer));
+      console.log(`/chat (${ai}) q="${question}" -> ${answer}`);
+      remember("CHAT", shown);
+      res.send(wrapForCalc(shown));
     } catch (e) {
       jobFailed("CHAT", e);
       console.error(e);
@@ -823,24 +850,22 @@ export async function chatgpt() {
     }
     startJob("EXPLAIN");
     try {
-      const client = await getAnthropic();
       const ask = "Explain the full solution step by step.";
-      const result = await client.messages.create({
-        model: ANTHROPIC_MODEL,
+      const { text: answer, ai } = await followUp({
         max_tokens: 32000,
         system: SYSTEM_PROMPT_EXPLAIN + STUDY_SYSTEM_NOTE,
         messages: withStudy([...chatHistory, { role: "user", content: ask }]),
       });
-      const answer = textFrom(result);
+      const shown = ai === "kimi" ? `KIMI: ${answer}` : answer;
 
       chatHistory.push({ role: "user", content: ask });
       chatHistory.push({ role: "assistant", content: answer });
       const tail = chatHistory.slice(2).slice(-CHAT_MAX_TURNS * 2);
       chatHistory = [...chatHistory.slice(0, 2), ...tail];
 
-      console.log(`/explain -> ${answer.length} chars: ${answer}`);
-      remember("EXPLAIN", answer);
-      res.send(wrapForCalc(answer));
+      console.log(`/explain (${ai}) -> ${answer.length} chars: ${answer}`);
+      remember("EXPLAIN", shown);
+      res.send(wrapForCalc(shown));
     } catch (e) {
       jobFailed("EXPLAIN", e);
       console.error(e);
@@ -860,7 +885,8 @@ export async function chatgpt() {
     startJob("MISTAKE");
     try {
       const client = await getAnthropic();
-      const answer = await generateMistake(client, level);
+      const kimiClient = lastProvider === "kimi" ? await getKimi() : null;
+      const answer = await generateMistake(client, level, undefined, undefined, kimiClient);
       console.log(`/mistake level ${level} -> ${answer.length} chars: ${answer}`);
       remember("MISTAKE", answer);
       res.send(wrapForCalc(answer));
